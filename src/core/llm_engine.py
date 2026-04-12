@@ -47,3 +47,31 @@ class LLMEngine:
 
     def clear_history(self) -> None:
         self.history.clear()
+
+    async def ask_with_prompt(self, system_prompt: str, user_input: str) -> str:
+        """
+        使用自定义系统提示词进行对话
+
+        Args:
+            system_prompt: 系统提示词
+            user_input: 用户输入
+
+        Returns:
+            LLM 回复内容
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ]
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={"model": self.model, "messages": messages},
+            )
+            response.raise_for_status()
+            result = response.json()
+            reply = result["choices"][0]["message"]["content"]
+
+        return reply
