@@ -1,8 +1,8 @@
-import asyncio
-import httpx
 import os
 from dataclasses import dataclass, field
 from typing import List
+
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,9 +14,9 @@ class Message:
 
 @dataclass
 class LLMEngine:
-    api_key: str = os.getenv("API_KEY")
-    model: str = "Qwen/Qwen3.5-4B"
-    base_url: str = "https://api.siliconflow.cn/v1"
+    api_key: str = os.getenv("LLM_API_KEY")
+    model: str = "/mnt/PublicStorage/lym/Qwen3.5-27B-GPTQ-Int4"
+    base_url: str = "http://172.28.9.59:11234/v1"
     history: List[Message] = field(default_factory=list)
 
     def add_user_message(self, content: str) -> None:
