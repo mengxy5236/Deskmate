@@ -1,16 +1,68 @@
 """
-意图路由模块
+意图路由
 根据 LLM 识别的意图，路由到对应的工具函数
 """
 
 import json
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List, TYPE_CHECKING
 from src.core.tools.registry import TOOL_REGISTRY, TOOL_DESCRIPTIONS
 
+if TYPE_CHECKING:
+    from src.core.database import Message as DBMsg
+
+INTENT_KEYWORDS: Dict[str, List[str]] = {
+    "weather": [
+        "天气", "气候", "气温", "温度", "下雨", "下雪", "晴天", "阴天",
+        "热", "冷", "湿度", "风", "PM2.5", "空气", "多少度"
+    ],
+    "news": [
+        "新闻", "消息", "头条", "资讯", "最新", "今天有什么", "最近发生"
+    ],
+}
+
+CHAT_KEYWORDS = [
+    "你好", "嗨", "hi", "hello", "在吗", "在不在", "早上好", "晚上好",
+    
+]
+
+def quick_match_intent(user_input: str) -> Optional[str]:
+    """
+    快速关键词匹配判断意图
+
+    Args:
+        user_input: 用户输入
+
+    Returns:
+        意图名称或 None
+    """
+    text = user_input.lower()
+
+    for intent, keywords in INTENT_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in text:
+                return intent
+
+    return None
+
+def is_direct_chat(user_input: str) -> bool:
+    """
+    判断是否为闲聊（直接回复，无需工具）
+
+    Args:
+        user_input: 用户输入
+
+    Returns:
+        True 表示闲聊，False 表示需要工具
+    """
+    text = user_input.lower()
+    for keyword in CHAT_KEYWORDS:
+        if keyword in text:
+            return True
+    return False
 
 class IntentRouter:
-    """意图路由器：根据识别到的意图调用对应工具"""
+    """根据识别到的意图调用对应工具"""
 
     def __init__(self):
         self.tools = TOOL_REGISTRY
@@ -20,7 +72,8 @@ class IntentRouter:
         """生成系统提示词，让 LLM 知道有哪些工具可用"""
         tools_json = json.dumps(
             list(self.tool_descriptions.values()),
-            ensure_ascii=False
+            ensure_ascii=False,
+            indent=2
         )
         return f"""你是一个智能助手。当用户提问时，你需要判断是否需要调用工具来回答。
 
@@ -77,6 +130,9 @@ class IntentRouter:
             result = await tool_func(**parameters)
             return result
         except Exception as e:
+            import traceback, sys
+            sys.stdout.reconfigure(encoding='utf-8')
+            traceback.print_exc()
             return f"执行 {intent} 时出错：{str(e)}"
 
     @staticmethod
@@ -90,8 +146,14 @@ class IntentRouter:
         Returns:
             解析后的字典
         """
-        # 尝试提取 JSON 部分
-        json_match = re.search(r'\{[^{}]*\}', response_text, re.DOTALL)
+        # 先尝试直接解析
+        try:
+            return json.loads(response_text.strip())
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试提取花括号内的内容（支持嵌套 JSON）
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
         if json_match:
             try:
                 return json.loads(json_match.group())
@@ -102,33 +164,95 @@ class IntentRouter:
         return {
             "intent": None,
             "parameters": {},
-            "direct_reply": response_text
+            "direct_reply": response_text.strip()
         }
 
+    async def process(
+        self,
+        user_input: str,
+        llm_engine,
+        history: Optional[List["DBMsg"]] = None
+    ) -> str:
+        """
+        处理用户输入的完整流程
 
-async def process_user_input(user_input: str, llm_engine) -> str:
-    """
-    处理用户输入的完整流程
+        Args:
+            user_input: 用户输入的文本
+            llm_engine: LLM 引擎实例
+            history: 对话历史（用于上下文），来自 database 的 Message 对象
 
-    Args:
-        user_input: 用户输入的文本
-        llm_engine: LLM 引擎实例
+        Returns:
+            最终回复文本
+        """
+        intent = quick_match_intent(user_input)
+        if intent is None:
+            if is_direct_chat(user_input):
+                return "你好！有什么我可以帮你的吗？"
 
-    Returns:
-        最终回复文本
-    """
-    router = IntentRouter()
+            llm_response = await llm_engine.ask_with_prompt(
+                self.get_system_prompt(),
+                user_input,
+                history
+            )
+            intent_result = self.parse_llm_response(llm_response)
+        else:
+            intent_result = self._build_intent_from_keywords(intent, user_input)
 
-    # 1. 让 LLM 判断意图
-    intent_response = await llm_engine.ask_with_prompt(
-        router.get_system_prompt(),
-        user_input
-    )
+        result = await self.route(intent_result)
+        return result
 
-    # 2. 解析 LLM 返回
-    intent_result = IntentRouter.parse_llm_response(intent_response)
+    def _build_intent_from_keywords(self, intent: str, user_input: str) -> Dict[str, Any]:
+        """
+        根据关键词匹配结果构造 intent_result
 
-    # 3. 路由到对应工具或返回直接回复
-    result = await router.route(intent_result)
+        Args:
+            intent: 意图名称
+            user_input: 用户输入
 
-    return result
+        Returns:
+            intent_result 字典
+        """
+        parameters = {}
+
+        # 从用户输入中提取参数
+        if intent == "weather":
+            city = self._extract_city(user_input)
+            parameters["city"] = city
+
+        return {
+            "intent": intent,
+            "parameters": parameters,
+            "direct_reply": None
+        }
+
+    def _extract_city(self, text: str) -> str:
+        """
+        从文本中提取城市名
+
+        Args:
+            text: 用户输入
+
+        Returns:
+            城市名，默认为 "天津"
+        """
+        # 常见城市列表
+        cities = [
+            "北京", "上海", "天津", "重庆", "广州", "深圳", "成都", "杭州",
+            "武汉", "南京", "西安", "苏州", "长沙", "郑州", "青岛", "沈阳",
+            "大连", "厦门", "宁波", "济南", "哈尔滨", "长春", "福州", "南昌",
+            "合肥", "昆明", "贵阳", "南宁", "石家庄", "太原", "呼和浩特",
+            "海口", "三亚", "兰州", "银川", "西宁", "乌鲁木齐", "拉萨",
+            "香港", "澳门", "台北"
+        ]
+
+        text = text.lower()
+        for city in cities:
+            if city in text:
+                return city
+
+        # 尝试匹配 "X 天气" 模式
+        match = re.search(r'([^\s]+)天气', text)
+        if match:
+            return match.group(1)
+
+        return "天津"  # 默认城市

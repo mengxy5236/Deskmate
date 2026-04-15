@@ -1,9 +1,10 @@
 import asyncio
 import random
 import re
+import html as html_module
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QPixmap, QIcon, QColor, QPainter
@@ -28,7 +29,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QKeySequence, QShortcut
 
-from src.core.llm_engine import LLMEngine
+from src.core.chat_backend import ChatBackend
 
 
 Role = Literal["user", "assistant", "system"]
@@ -38,7 +39,7 @@ Role = Literal["user", "assistant", "system"]
 class SessionState:
     title: str
     messages: List[tuple[Role, str]] = field(default_factory=list)
-    engine: LLMEngine = field(default_factory=LLMEngine)
+    db_session_id: int = 0
 
 
 class AsyncWorker(QThread):
@@ -47,22 +48,28 @@ class AsyncWorker(QThread):
 
     def __init__(
         self,
-        llm_engine: LLMEngine,
+        chat_backend: ChatBackend,
         prompt: str,
+        session_id: int,
     ) -> None:
         super().__init__()
-        self.llm_engine = llm_engine
+        self.chat_backend = chat_backend
         self.prompt = prompt
+        self.session_id = session_id
 
     def run(self) -> None:
         try:
             result = asyncio.run(self._execute())
             self.finished.emit(result)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.error.emit(str(exc))
 
     async def _execute(self) -> str:
-        return await self.llm_engine.ask(self.prompt)
+        reply, _ = await self.chat_backend.send_message(
+            content=self.prompt,
+            session_id=self.session_id,
+        )
+        return reply
 
 
 class ScheduleDialog(QDialog):
@@ -122,6 +129,8 @@ class ChatWidget(QWidget):
         self.is_dark_theme = False
         self.is_waiting_response = False
         self.session_panel_expanded = True
+
+        self.backend = ChatBackend()
 
         self._build_ui()
         self.create_session()
@@ -192,7 +201,11 @@ class ChatWidget(QWidget):
         session_id = f"session_{self.session_counter}"
         title = f"新对话 {self.session_counter}"
         self.session_counter += 1
-        self.sessions[session_id] = SessionState(title=title)
+        db_session_id = self.backend.create_session(title)
+        self.sessions[session_id] = SessionState(
+            title=title,
+            db_session_id=db_session_id,
+        )
 
         item = QListWidgetItem(title)
         item.setData(Qt.ItemDataRole.UserRole, session_id)
@@ -215,8 +228,13 @@ class ChatWidget(QWidget):
     def render_current_session(self) -> None:
         self.chat_browser.clear()
         state = self.sessions[self.current_session_id]
-        for role, content in state.messages:
-            self.append_message(role, content, persist=False)
+        if state.db_session_id:
+            db_messages = self.backend.get_history(state.db_session_id)
+            for msg in db_messages:
+                self.append_message(msg.role, msg.content, persist=False)
+        else:
+            for role, content in state.messages:
+                self.append_message(role, content, persist=False)
 
     def show_session_menu(self, pos) -> None:
         item = self.session_list.itemAt(pos)
@@ -254,6 +272,10 @@ class ChatWidget(QWidget):
             QMessageBox.information(self, "提示", "至少保留一个会话")
             return
 
+        state = self.sessions.get(session_id)
+        if state and state.db_session_id:
+            self.backend.delete_session(state.db_session_id)
+
         for row in range(self.session_list.count()):
             item = self.session_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == session_id:
@@ -275,24 +297,55 @@ class ChatWidget(QWidget):
         if state is None:
             return
         state.messages.clear()
-        state.engine.clear_history()
+        if state.db_session_id:
+            self.backend.clear_history(state.db_session_id)
         if sid == self.current_session_id:
             self.chat_browser.clear()
 
+    @staticmethod
+    def _escape_html(text: str) -> str:
+        return html_module.escape(text).replace("\n", "<br/>")
+
     def append_message(self, role: Role, content: str, persist: bool = True) -> None:
-        style = {
-            "user": "background:#4F46E5;color:#ffffff;align-self:flex-end;",
-            "assistant": "background:#EEF2FF;color:#111827;align-self:flex-start;",
-            "system": "background:#F3F4F6;color:#374151;align-self:flex-start;",
-        }
+        if role == "user":
+            bg = "#4F46E5"
+            text_color = "#ffffff"
+            align = "right"
+            cell_color = "#E0E7FF"
+        elif role == "assistant":
+            bg = "#F8FAFC"
+            text_color = "#111827"
+            align = "left"
+            cell_color = "#EEF2FF"
+        else:
+            bg = "#F3F4F6"
+            text_color = "#374151"
+            align = "left"
+            cell_color = "#F3F4F6"
+
+        escaped = self._escape_html(content)
         html = (
-            f"<div style='margin:8px 0; display:flex; justify-content:{'flex-end' if role == 'user' else 'flex-start'};'>"
-            f"<div style='max-width:78%; border-radius:12px; padding:10px 12px; {style[role]}'>"
-            f"<pre style='margin:0; white-space:pre-wrap; font-family:Microsoft YaHei UI;'>{content}</pre>"
-            "</div></div>"
+            f"<table width='100%' style='margin:6px 0; border-collapse:collapse;'>"
+            f"<tr>"
+            f"<td align='{align}' style='padding:0 8px;'>"
+            f"<div style='"
+            f"display:inline-block; "
+            f"max-width:75%; "
+            f"background:{cell_color}; "
+            f"border-radius:12px; "
+            f"padding:10px 14px; "
+            f"border:1px solid {'#C7D2FE' if role=='user' else '#E5E7EB'};'>"
+            f"<div style='color:{text_color}; font-family:\"Microsoft YaHei UI\",sans-serif; "
+            f"font-size:14px; line-height:1.6; white-space:pre-wrap; word-break:break-word;'>"
+            f"{escaped}"
+            f"</div>"
+            f"</div>"
+            f"</td></tr></table>"
         )
         self.chat_browser.append(html)
-        self.chat_browser.verticalScrollBar().setValue(self.chat_browser.verticalScrollBar().maximum())
+        self.chat_browser.verticalScrollBar().setValue(
+            self.chat_browser.verticalScrollBar().maximum()
+        )
 
         if persist:
             self.sessions[self.current_session_id].messages.append((role, content))
@@ -311,15 +364,18 @@ class ChatWidget(QWidget):
         self._send_message(content)
 
     def _send_message(self, content: str) -> None:
-        """发送消息并启动异步 worker。"""
         self.set_busy(True, "思考中...")
         self.is_waiting_response = True
 
         self.append_message("user", content)
         self.input_edit.clear()
 
-        llm_engine = self.sessions[self.current_session_id].engine
-        self.worker = AsyncWorker(llm_engine=llm_engine, prompt=content)
+        state = self.sessions[self.current_session_id]
+        self.worker = AsyncWorker(
+            chat_backend=self.backend,
+            prompt=content,
+            session_id=state.db_session_id,
+        )
         self.worker.finished.connect(self._on_reply_received)
         self.worker.error.connect(self._on_error)
         self.worker.start()
@@ -387,7 +443,7 @@ class MainWindow(QMainWindow):
         self.apply_theme("light")
 
     @staticmethod
-    def _natural_sort_key(path: Path) -> List[object]:
+    def _natural_sort_key(path: Path) -> List[int | str]:
         parts = re.split(r"(\d+)", path.name)
         return [int(part) if part.isdigit() else part.lower() for part in parts]
 
@@ -448,6 +504,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(button_box)
         return panel
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "pet_label") and self.pet_label.width() > 0:
+            self._refresh_scaled_pet_frames()
+
     def _load_pet_frames(self) -> List[QPixmap]:
         pet_dir = Path("src/asset/default")
         frame_paths: List[Path] = []
@@ -488,6 +549,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_scaled_pet_frames(self) -> None:
         target_size = self.pet_label.size()
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return
         self.scaled_pet_frames = [
             frame.scaled(
                 target_size.width(),
@@ -503,7 +566,6 @@ class MainWindow(QMainWindow):
             self._update_pet_frame()
             return
 
-        # 往返轮播：0->1->2->3->2->1，更接近桌宠动作感。
         self.pet_index += self.pet_direction
         if self.pet_index >= len(self.pet_frames) - 1:
             self.pet_index = len(self.pet_frames) - 1
@@ -514,8 +576,11 @@ class MainWindow(QMainWindow):
         self._update_pet_frame()
 
     def _update_pet_frame(self) -> None:
-        if not self.scaled_pet_frames:
-            self._refresh_scaled_pet_frames()
+        if not self.scaled_pet_frames or self.pet_index >= len(self.scaled_pet_frames):
+            if self.pet_label.width() > 0 and self.pet_label.height() > 0:
+                self._refresh_scaled_pet_frames()
+            if not self.scaled_pet_frames:
+                return
         pixmap = self.scaled_pet_frames[self.pet_index]
         self.pet_label.setPixmap(pixmap)
 

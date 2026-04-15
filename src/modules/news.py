@@ -5,19 +5,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.getenv("NEW_API_KEY")  # 去 https://newsdata.io/ 申请
+URL = os.getenv("NEW_URL")
 
 async def get_news() -> str:
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(
-            "https://newsdata.io/api/1/latest",
-            params={
-                "apikey": API_KEY,
-                "language": "zh",
-                "category": "top"
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
+    if not URL or not API_KEY:
+        return "新闻接口配置不完整，请检查 .env 文件中的 NEW_API_KEY 和 NEW_URL"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                URL,
+                params={
+                    "apikey": API_KEY,
+                    "language": "zh",
+                    "category": "top"
+                }
+            )
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPStatusError as e:
+        return f"新闻接口返回错误: {e.response.status_code}"
+    except httpx.RequestError as e:
+        return f"新闻接口请求失败: {e}"
 
     results = data.get("results", [])
     if not results:

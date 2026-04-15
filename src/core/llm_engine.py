@@ -1,22 +1,27 @@
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, TYPE_CHECKING
 
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
+if TYPE_CHECKING:
+    from src.core.database import Message as DBMsg
+
+
 @dataclass
 class Message:
-    role: str # "user" 或 "assistant"
+    role: str  # "user" 或 "assistant"
     content: str
+
 
 @dataclass
 class LLMEngine:
     api_key: str = os.getenv("LLM_API_KEY")
-    model: str = "/mnt/PublicStorage/lym/Qwen3.5-27B-GPTQ-Int4"
-    base_url: str = "http://172.28.9.59:11234/v1"
+    model: str = os.getenv("LLM_MODEL")
+    base_url: str = os.getenv("LLM_BASE_URL")
     history: List[Message] = field(default_factory=list)
 
     def add_user_message(self, content: str) -> None:
@@ -36,7 +41,12 @@ class LLMEngine:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "messages": messages},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": False,
+                    "thinking": {"type": "disabled"}
+                },
             )
             response.raise_for_status()
             result = response.json()
@@ -48,27 +58,41 @@ class LLMEngine:
     def clear_history(self) -> None:
         self.history.clear()
 
-    async def ask_with_prompt(self, system_prompt: str, user_input: str) -> str:
+    async def ask_with_prompt(
+        self,
+        system_prompt: str,
+        user_input: str,
+        history: Optional[List["DBMsg"]] = None,
+    ) -> str:
         """
         使用自定义系统提示词进行对话
 
         Args:
             system_prompt: 系统提示词
             user_input: 用户输入
+            history: 对话历史（用于上下文），来自 database.Message 对象
 
         Returns:
             LLM 回复内容
         """
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ]
+        messages = [{"role": "system", "content": system_prompt}]
+
+        if history:
+            for msg in history[-10:]:  # 最近 10 条
+                messages.append({"role": msg.role, "content": msg.content})
+
+        messages.append({"role": "user", "content": user_input})
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "messages": messages},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": False,
+                    "thinking": {"type": "disabled"}
+                },
             )
             response.raise_for_status()
             result = response.json()
