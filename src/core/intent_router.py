@@ -23,7 +23,6 @@ INTENT_KEYWORDS: Dict[str, List[str]] = {
 
 CHAT_KEYWORDS = [
     "你好", "嗨", "hi", "hello", "在吗", "在不在", "早上好", "晚上好",
-    
 ]
 
 def quick_match_intent(user_input: str) -> Optional[str]:

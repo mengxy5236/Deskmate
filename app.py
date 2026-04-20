@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.ui.main_window import run_app
+from src.ui.bubble_window import run_app
 
 
 if __name__ == "__main__":

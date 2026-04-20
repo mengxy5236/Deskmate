@@ -10,3 +10,7 @@
 /httpRequests/
 # 文档
 /docs/
+
+.env
+
+.idea

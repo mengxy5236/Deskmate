@@ -105,3 +105,44 @@ class ChatBackend:
             session_id: 会话 ID
         """
         self.db.delete_session(session_id)
+
+    async def send_message_stream(self, content: str, session_id: Optional[int] = None):
+        """
+        流式发送消息。
+
+        先通过 IntentRouter 获取完整回复（支持工具调用），再将回复逐字 yield
+        给前端，实现打字机效果。数据库在流结束后一次性写入。
+
+        Args:
+            content: 用户输入
+            session_id: 会话 ID（None 表示创建新会话）
+
+        Yields:
+            str: 回复文本的片段
+        """
+        if session_id is None:
+            session_id = self.db.create_session()
+
+        self.db.add_message(session_id, "user", content)
+        history = self.db.get_history(session_id)
+
+        reply = await self.router.process(content, self.llm, history)
+        self.db.add_message(session_id, "assistant", reply)
+
+        for chunk in _stream_text(reply):
+            yield chunk
+
+
+def _stream_text(text: str, chunk_size: int = 3):
+    """
+    将文本拆分成小块，用于模拟打字机效果。
+
+    Args:
+        text: 完整文本
+        chunk_size: 每块字符数
+
+    Yields:
+        文本片段
+    """
+    for i in range(0, len(text), chunk_size):
+        yield text[i : i + chunk_size]

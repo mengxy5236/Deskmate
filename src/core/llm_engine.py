@@ -1,6 +1,7 @@
+import json
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, AsyncIterator, TYPE_CHECKING
 
 import httpx
 from dotenv import load_dotenv
@@ -99,3 +100,43 @@ class LLMEngine:
             reply = result["choices"][0]["message"]["content"]
 
         return reply
+
+    async def stream(
+        self,
+        messages: List[dict],
+    ) -> AsyncIterator[str]:
+        """
+        发起流式 LLM 请求。
+
+        Args:
+            messages: OpenAI 格式的 messages 列表
+
+        Yields:
+            每个 content delta 片段
+        """
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": True,
+                },
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content_delta = delta.get("content", "")
+                    if content_delta:
+                        yield content_delta
