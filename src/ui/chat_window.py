@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QEvent
 from PyQt6.QtGui import QAction, QPixmap, QIcon, QColor, QPainter
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -130,6 +130,22 @@ class ChatWidget(QWidget):
         self.is_waiting_response = False
         self.session_panel_expanded = True
 
+        # 主题配色（assistant_background, user_background）
+        self.theme_pairs: List[tuple[str, str]] = [
+            ("#BE98AA", "#3E3F4C"),
+            ("#E1DAD9", "#4D3A59"),
+            ("#C8C7C5", "#002FA7"),
+            ("#DCD2C6", "#800020"),
+            ("#467897", "#E7CD79"),
+            ("#8A77A5", "#DBE196"),
+            ("#DBCCB1", "#94AA67"),
+            ("#C99E8C", "#465E65"),
+            ("#C8C7C5", "#98A594"),
+        ]
+        self.current_theme_index = 0
+        self.assistant_bubble_color = self.theme_pairs[0][0]
+        self.user_bubble_color = self.theme_pairs[0][1]
+
         self.backend = ChatBackend()
 
         self._build_ui()
@@ -164,6 +180,11 @@ class ChatWidget(QWidget):
 
         self.chat_browser = QTextBrowser()
         self.chat_browser.setOpenExternalLinks(True)
+        self.chat_browser.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chat_browser.customContextMenuRequested.connect(self.show_theme_menu)
+        # 安装事件过滤，确保在 QTextBrowser 的 viewport 区域也能拦截右键
+        self.chat_browser.installEventFilter(self)
+        self.chat_browser.viewport().installEventFilter(self)
 
         input_layout = QHBoxLayout()
         self.input_edit = QTextEdit()
@@ -308,20 +329,17 @@ class ChatWidget(QWidget):
 
     def append_message(self, role: Role, content: str, persist: bool = True) -> None:
         if role == "user":
-            bg = "#4F46E5"
-            text_color = "#ffffff"
             align = "right"
-            cell_color = "#E0E7FF"
+            cell_color = self.user_bubble_color
+            text_color = self._text_color_for_bg(cell_color)
         elif role == "assistant":
-            bg = "#F8FAFC"
-            text_color = "#111827"
             align = "left"
-            cell_color = "#EEF2FF"
+            cell_color = self.assistant_bubble_color
+            text_color = self._text_color_for_bg(cell_color)
         else:
-            bg = "#F3F4F6"
-            text_color = "#374151"
             align = "left"
             cell_color = "#F3F4F6"
+            text_color = "#374151"
 
         escaped = self._escape_html(content)
         html = (
@@ -334,7 +352,7 @@ class ChatWidget(QWidget):
             f"background:{cell_color}; "
             f"border-radius:12px; "
             f"padding:10px 14px; "
-            f"border:1px solid {'#C7D2FE' if role=='user' else '#E5E7EB'};'>"
+            f"border:1px solid {self._derive_border_color(cell_color)}>"
             f"<div style='color:{text_color}; font-family:\"Microsoft YaHei UI\",sans-serif; "
             f"font-size:14px; line-height:1.6; white-space:pre-wrap; word-break:break-word;'>"
             f"{escaped}"
@@ -349,6 +367,68 @@ class ChatWidget(QWidget):
 
         if persist:
             self.sessions[self.current_session_id].messages.append((role, content))
+
+    def _hex_to_rgb(self, hex_color: str) -> tuple[int, int, int]:
+        hex_color = hex_color.lstrip("#")
+        return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+
+    def _luminance(self, hex_color: str) -> float:
+        r, g, b = self._hex_to_rgb(hex_color)
+        # relative luminance, sRGB
+        def chan(c: int) -> float:
+            c = c / 255.0
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+        R, G, B = chan(r), chan(g), chan(b)
+        return 0.2126 * R + 0.7152 * G + 0.0722 * B
+
+    def _text_color_for_bg(self, hex_color: str) -> str:
+        # 返回白色或深色以保证对比
+        lum = self._luminance(hex_color)
+        return "#FFFFFF" if lum < 0.5 else "#111827"
+
+    def _derive_border_color(self, hex_color: str) -> str:
+        r, g, b = self._hex_to_rgb(hex_color)
+        # 稍微变暗作为边框
+        dr = max(0, int(r * 0.75))
+        dg = max(0, int(g * 0.75))
+        db = max(0, int(b * 0.75))
+        return f"#{dr:02X}{dg:02X}{db:02X}"
+
+    def show_theme_menu(self, pos) -> None:
+        menu = QMenu(self)
+        theme_menu = QMenu("切换气泡主题", self)
+        for idx, (assistant_col, user_col) in enumerate(self.theme_pairs):
+            action = QAction(self)
+            action.setText(f"主题 {idx + 1}: {assistant_col} / {user_col}")
+            # 制作小图标，左右两色
+            pix = QPixmap(64, 16)
+            painter = QPainter(pix)
+            painter.fillRect(0, 0, 32, 16, QColor(assistant_col))
+            painter.fillRect(32, 0, 32, 16, QColor(user_col))
+            painter.end()
+            action.setIcon(QIcon(pix))
+            action.triggered.connect(lambda checked=False, i=idx: self.set_theme(i))
+            theme_menu.addAction(action)
+
+        menu.addMenu(theme_menu)
+        menu.exec(self.chat_browser.mapToGlobal(pos))
+
+    def set_theme(self, index: int) -> None:
+        if index < 0 or index >= len(self.theme_pairs):
+            return
+        self.current_theme_index = index
+        self.assistant_bubble_color, self.user_bubble_color = self.theme_pairs[index]
+        # 重新渲染当前会话历史消息以应用新配色
+        self.render_current_session()
+
+    def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        # 拦截 QTextBrowser 的上下文菜单事件（QEvent.ContextMenu）并显示主题菜单
+        if (obj is self.chat_browser or obj is getattr(self.chat_browser, "viewport", lambda: None)()) and event.type() == QEvent.Type.ContextMenu:
+            pos = event.pos()
+            self.show_theme_menu(pos)
+            return True
+        return super().eventFilter(obj, event)
 
     def set_busy(self, busy: bool, text: str = "") -> None:
         self.input_edit.setDisabled(busy)
