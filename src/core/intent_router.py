@@ -1,15 +1,27 @@
 """
-意图路由
-根据 LLM 识别的意图，路由到对应的工具函数
+意图路由 & ReAct 循环执行器
+
+架构：
+  process() 是入口，先用关键词快速匹配，匹配不上才走 ReAct 循环。
+  ReAct 循环：发消息给 LLM → LLM 决定是否调用工具 →
+             执行工具 → 把结果塞回 messages → 循环 →
+             LLM 生成自然语言回复 → 返回
+
+新闻详情回查：
+  用户输入纯数字（如"1"、"2"）时，从当前 session 的缓存中
+  取出对应编号的新闻详情（摘要 + 原文链接）直接返回。
 """
 
 import json
 import re
-from typing import Dict, Any, Optional, List, TYPE_CHECKING
+from typing import Dict, Any, Optional, List, Tuple, TYPE_CHECKING
+
 from src.core.tools.registry import TOOL_REGISTRY, TOOL_DESCRIPTIONS
 
 if TYPE_CHECKING:
     from src.core.database import Message as DBMsg
+    from src.core.llm_engine import LLMEngine
+
 
 INTENT_KEYWORDS: Dict[str, List[str]] = {
     "weather": [
@@ -25,233 +37,206 @@ CHAT_KEYWORDS = [
     "你好", "嗨", "hi", "hello", "在吗", "在不在", "早上好", "晚上好",
 ]
 
+
+def _is_whole_word_match(text: str, keyword: str) -> bool:
+    pattern = r'(?:^|[^\u4e00-\u9fff\w])' + re.escape(keyword) + r'(?:$|[^\u4e00-\u9fff\w])'
+    return bool(re.search(pattern, text))
+
+
 def quick_match_intent(user_input: str) -> Optional[str]:
-    """
-    快速关键词匹配判断意图
-
-    Args:
-        user_input: 用户输入
-
-    Returns:
-        意图名称或 None
-    """
     text = user_input.lower()
-
     for intent, keywords in INTENT_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword in text:
-                return intent
-
+        if any(_is_whole_word_match(text, kw) for kw in keywords):
+            return intent
     return None
 
+
 def is_direct_chat(user_input: str) -> bool:
-    """
-    判断是否为闲聊（直接回复，无需工具）
-
-    Args:
-        user_input: 用户输入
-
-    Returns:
-        True 表示闲聊，False 表示需要工具
-    """
     text = user_input.lower()
-    for keyword in CHAT_KEYWORDS:
-        if keyword in text:
-            return True
-    return False
+    return any(_is_whole_word_match(text, kw) for kw in CHAT_KEYWORDS)
+
+
+def _is_pure_digit(text: str) -> bool:
+    return bool(re.fullmatch(r'\s*\d+\s*', text))
+
 
 class IntentRouter:
-    """根据识别到的意图调用对应工具"""
+
+    SYSTEM_PROMPT = """你是一个友好的中文桌面助手，用户通过气泡窗口和你交流。
+你有以下工具可用，必要时必须调用工具来回答用户问题，不要凭空编造信息。
+工具调用是自动的，不需要询问用户是否要调用。"""
+
+    MAX_TOOL_ITERATIONS = 5
 
     def __init__(self):
         self.tools = TOOL_REGISTRY
-        self.tool_descriptions = TOOL_DESCRIPTIONS
+        self._tool_schemas = self._build_schemas()
+        self._news_cache: Dict[int, List[Any]] = {}
 
-    def get_system_prompt(self) -> str:
-        """生成系统提示词，让 LLM 知道有哪些工具可用"""
-        tools_json = json.dumps(
-            list(self.tool_descriptions.values()),
-            ensure_ascii=False,
-            indent=2
-        )
-        return f"""你是一个智能助手。当用户提问时，你需要判断是否需要调用工具来回答。
+    def _build_schemas(self) -> List[Dict[str, Any]]:
+        schemas = []
+        for name, desc in TOOL_DESCRIPTIONS.items():
+            schemas.append({
+                "type": "function",
+                "function": {
+                    "name": desc["name"],
+                    "description": desc["description"],
+                    "parameters": desc["parameters"],
+                }
+            })
+        return schemas
 
-可用工具：
-{tools_json}
-
-判断规则：
-- 如果用户询问天气相关问题（如"天气怎么样"、"今天热吗"、"会下雨吗"等），必须调用 weather 工具。
-- 如果用户询问新闻相关问题（如"今天有什么新闻"、"最新消息"等），必须调用 news 工具。
-- 如果是一般对话或闲聊，直接回答。
-
-返回格式（JSON）：
-{{"intent": "工具名称或null", "parameters": {{"参数名": "参数值"}}, "direct_reply": "直接回复内容（仅当不需要工具时）"}}
-
-示例：
-用户："北京今天天气如何？"
-返回：{{"intent": "weather", "parameters": {{"city": "北京"}}, "direct_reply": null}}
-
-用户："你好"
-返回：{{"intent": null, "parameters": {{}}, "direct_reply": "你好！有什么我可以帮你的吗？"}}
-
-用户："给我看看新闻"
-返回：{{"intent": "news", "parameters": {{}}, "direct_reply": null}}"""
-
-    async def route(self, intent_result: Dict[str, Any]) -> str:
-        """
-        根据意图结果路由到对应工具
-
-        Args:
-            intent_result: 包含 intent, parameters, direct_reply 的字典
-
-        Returns:
-            工具执行结果或直接回复内容
-        """
-        intent = intent_result.get("intent")
-        parameters = intent_result.get("parameters", {})
-        direct_reply = intent_result.get("direct_reply")
-
-        # 如果是直接回复，不需要调用工具
-        if direct_reply:
-            return direct_reply
-
-        # 如果没有识别到意图，返回默认回复
-        if not intent:
-            return "抱歉，我不太理解你的问题。请换个方式问我，或者问我天气、新闻相关的内容。"
-
-        # 检查工具是否存在
-        if intent not in self.tools:
-            return f"抱歉，暂不支持 '{intent}' 功能。"
-
-        try:
-            # 调用对应的工具函数
-            tool_func = self.tools[intent]
-            result = await tool_func(**parameters)
-            return result
-        except Exception as e:
-            import traceback, sys
-            sys.stdout.reconfigure(encoding='utf-8')
-            traceback.print_exc()
-            return f"执行 {intent} 时出错：{str(e)}"
-
-    @staticmethod
-    def parse_llm_response(response_text: str) -> Dict[str, Any]:
-        """
-        解析 LLM 返回的 JSON 响应
-
-        Args:
-            response_text: LLM 返回的原始文本
-
-        Returns:
-            解析后的字典
-        """
-        # 先尝试直接解析
-        try:
-            return json.loads(response_text.strip())
-        except json.JSONDecodeError:
-            pass
-
-        # 尝试提取花括号内的内容（支持嵌套 JSON）
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
-
-        # 如果解析失败，返回错误标记
-        return {
-            "intent": None,
-            "parameters": {},
-            "direct_reply": response_text.strip()
-        }
-
-    async def process(
+    async def route(
         self,
         user_input: str,
-        llm_engine,
-        history: Optional[List["DBMsg"]] = None
+        llm: "LLMEngine",
+        history: Optional[List["DBMsg"]] = None,
+        session_id: Optional[int] = None,
     ) -> str:
-        """
-        处理用户输入的完整流程
+        if _is_pure_digit(user_input) and session_id is not None:
+            cached = self._news_cache.get(session_id, [])
+            if cached:
+                detail = await self._lookup_news_detail(cached, user_input)
+                if detail is not None:
+                    return detail
 
-        Args:
-            user_input: 用户输入的文本
-            llm_engine: LLM 引擎实例
-            history: 对话历史（用于上下文），来自 database 的 Message 对象
-
-        Returns:
-            最终回复文本
-        """
         intent = quick_match_intent(user_input)
-        if intent is None:
-            if is_direct_chat(user_input):
-                return "你好！有什么我可以帮你的吗？"
 
-            llm_response = await llm_engine.ask_with_prompt(
-                self.get_system_prompt(),
-                user_input,
-                history
-            )
-            intent_result = self.parse_llm_response(llm_response)
-        else:
-            intent_result = self._build_intent_from_keywords(intent, user_input)
+        if intent:
+            reply, news_items = await self._execute_tool(intent, user_input)
+            if intent == "news" and news_items is not None:
+                self._news_cache[session_id or 0] = news_items
+            return reply
 
-        result = await self.route(intent_result)
-        return result
+        if is_direct_chat(user_input):
+            return "你好！有什么我可以帮你的吗？"
 
-    def _build_intent_from_keywords(self, intent: str, user_input: str) -> Dict[str, Any]:
-        """
-        根据关键词匹配结果构造 intent_result
+        return await self._react_loop(user_input, llm, history)
 
-        Args:
-            intent: 意图名称
-            user_input: 用户输入
+    async def _lookup_news_detail(
+        self, items: List[Any], user_input: str
+    ) -> Optional[str]:
+        from src.modules.news import get_news_by_index
+        return await get_news_by_index(items, user_input)
 
-        Returns:
-            intent_result 字典
-        """
-        parameters = {}
-
-        # 从用户输入中提取参数
+    async def _execute_tool(
+        self, intent: str, user_input: str
+    ) -> Tuple[str, Optional[List[Any]]]:
+        params: Dict[str, Any] = {}
         if intent == "weather":
-            city = self._extract_city(user_input)
-            parameters["city"] = city
+            params["city"] = self._extract_city(user_input)
 
-        return {
-            "intent": intent,
-            "parameters": parameters,
-            "direct_reply": None
-        }
+        try:
+            tool_func = self.tools[intent]
+            result = await tool_func(**params)
+            if intent == "news" and isinstance(result, tuple):
+                text, items = result
+                return text, items
+            return result, None
+        except Exception as e:
+            return f"执行 {intent} 时出错：{str(e)}", None
+
+    async def _react_loop(
+        self,
+        user_input: str,
+        llm: "LLMEngine",
+        history: Optional[List["DBMsg"]],
+    ) -> str:
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.SYSTEM_PROMPT}
+        ]
+
+        if history:
+            for msg in history[-10:]:
+                messages.append({"role": msg.role, "content": msg.content})
+
+        messages.append({"role": "user", "content": user_input})
+
+        tool_iterations = 0
+
+        while tool_iterations < self.MAX_TOOL_ITERATIONS:
+            raw = await llm.ask_with_tools(messages, self._tool_schemas)
+
+            tool_calls, text_reply = raw
+            assistant_msg: Dict[str, Any] = {}
+
+            if tool_calls:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": text_reply or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                            }
+                        }
+                        for tc in tool_calls
+                    ]
+                }
+                messages.append(assistant_msg)
+
+                for tc in tool_calls:
+                    tool_result = await self._execute_single_tool(tc.name, tc.arguments)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_result,
+                    })
+
+                tool_iterations += 1
+                continue
+
+            if text_reply is not None:
+                return text_reply
+
+            tool_iterations += 1
+
+        return "抱歉，我处理你的问题时遇到了一些问题，请稍后再试。"
+
+    async def _execute_single_tool(
+        self,
+        name: str,
+        arguments: Dict[str, Any],
+    ) -> str:
+        if name not in self.tools:
+            return f"错误：未找到工具 '{name}'"
+
+        try:
+            tool_func = self.tools[name]
+            result = await tool_func(**arguments)
+            if isinstance(result, tuple):
+                return result[0]
+            return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            return f"工具 '{name}' 执行出错：{str(e)}"
 
     def _extract_city(self, text: str) -> str:
-        """
-        从文本中提取城市名
-
-        Args:
-            text: 用户输入
-
-        Returns:
-            城市名，默认为 "天津"
-        """
-        # 常见城市列表
         cities = [
             "北京", "上海", "天津", "重庆", "广州", "深圳", "成都", "杭州",
             "武汉", "南京", "西安", "苏州", "长沙", "郑州", "青岛", "沈阳",
             "大连", "厦门", "宁波", "济南", "哈尔滨", "长春", "福州", "南昌",
             "合肥", "昆明", "贵阳", "南宁", "石家庄", "太原", "呼和浩特",
             "海口", "三亚", "兰州", "银川", "西宁", "乌鲁木齐", "拉萨",
-            "香港", "澳门", "台北"
+            "香港", "澳门", "台北",
         ]
-
-        text = text.lower()
+        text_lower = text.lower()
         for city in cities:
-            if city in text:
+            if city in text_lower:
                 return city
 
-        # 尝试匹配 "X 天气" 模式
-        match = re.search(r'([^\s]+)天气', text)
+        match = re.search(r'([^\s]+)天气', text_lower)
         if match:
             return match.group(1)
+        return "天津"
 
-        return "天津"  # 默认城市
+    async def process(
+        self,
+        user_input: str,
+        llm: "LLMEngine",
+        history: Optional[List["DBMsg"]] = None,
+        session_id: Optional[int] = None,
+    ) -> str:
+        return await self.route(user_input, llm, history, session_id)

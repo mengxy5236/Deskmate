@@ -1,7 +1,7 @@
 import json
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, AsyncIterator, TYPE_CHECKING
+from typing import List, Optional, AsyncIterator, Dict, Any, TYPE_CHECKING
 
 import httpx
 from dotenv import load_dotenv
@@ -14,8 +14,15 @@ if TYPE_CHECKING:
 
 @dataclass
 class Message:
-    role: str  # "user" 或 "assistant"
+    role: str
     content: str
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: Dict[str, Any]
 
 
 @dataclass
@@ -31,33 +38,41 @@ class LLMEngine:
     def add_assistant_message(self, content: str) -> None:
         self.history.append(Message(role="assistant", content=content))
 
-    async def ask(self, user_input: str) -> str:
-        self.add_user_message(user_input)
+    def clear_history(self) -> None:
+        self.history.clear()
 
-        messages = [
-            {"role": m.role, "content": m.content} for m in self.history
-        ]
+    async def _request(
+        self,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        stream: bool = False,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": stream,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "stream": False,
-                    "thinking": {"type": "disabled"}
-                },
+                json=payload,
             )
             response.raise_for_status()
-            result = response.json()
-            reply = result["choices"][0]["message"]["content"]
+            return response.json()
 
+    async def ask(self, user_input: str) -> str:
+        self.add_user_message(user_input)
+        messages = [{"role": m.role, "content": m.content} for m in self.history]
+        result = await self._request(messages, stream=False)
+        reply = result["choices"][0]["message"]["content"]
         self.add_assistant_message(reply)
         return reply
-
-    def clear_history(self) -> None:
-        self.history.clear()
 
     async def ask_with_prompt(
         self,
@@ -65,41 +80,43 @@ class LLMEngine:
         user_input: str,
         history: Optional[List["DBMsg"]] = None,
     ) -> str:
-        """
-        使用自定义系统提示词进行对话
-
-        Args:
-            system_prompt: 系统提示词
-            user_input: 用户输入
-            history: 对话历史（用于上下文），来自 database.Message 对象
-
-        Returns:
-            LLM 回复内容
-        """
         messages = [{"role": "system", "content": system_prompt}]
-
         if history:
-            for msg in history[-10:]:  # 最近 10 条
+            for msg in history[-10:]:
                 messages.append({"role": msg.role, "content": msg.content})
-
         messages.append({"role": "user", "content": user_input})
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "stream": False,
-                    "thinking": {"type": "disabled"}
-                },
-            )
-            response.raise_for_status()
-            result = response.json()
-            reply = result["choices"][0]["message"]["content"]
+        result = await self._request(messages, stream=False)
+        return result["choices"][0]["message"]["content"]
 
-        return reply
+    async def ask_with_tools(
+        self,
+        messages: List[Dict[str, str]],
+        tools: List[Dict[str, Any]],
+        tool_call_id_to_name: Optional[Dict[str, str]] = None,
+    ) -> tuple[Optional[List[ToolCall]], Optional[str]]:
+        result = await self._request(messages, tools=tools, stream=False)
+
+        msg = result["choices"][0]["message"]
+        content = msg.get("content")
+        raw_tool_calls = msg.get("tool_calls", [])
+        finish_reason = result["choices"][0].get("finish_reason")
+
+        if not raw_tool_calls:
+            return None, content
+
+        tool_calls = []
+        for tc in raw_tool_calls:
+            func = tc["function"]
+            name = func["name"]
+            if name is None and tc.get("id") and tool_call_id_to_name:
+                name = tool_call_id_to_name.get(tc["id"])
+            tool_calls.append(ToolCall(
+                id=tc["id"],
+                name=name or "",
+                arguments=json.loads(func["arguments"]),
+            ))
+        return tool_calls, None
 
     async def stream(
         self,
@@ -107,9 +124,6 @@ class LLMEngine:
     ) -> AsyncIterator[str]:
         """
         发起流式 LLM 请求。
-
-        Args:
-            messages: OpenAI 格式的 messages 列表
 
         Yields:
             每个 content delta 片段

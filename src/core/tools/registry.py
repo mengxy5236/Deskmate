@@ -1,28 +1,31 @@
 """
 工具注册表
-统一管理所有可用的工具函数
+
+统一管理所有可用的工具函数及其 OpenAI-compatible schema。
 """
 
 from src.modules.weather import get_weather
 from src.modules.news import get_news
 
-# 工具注册表：名称 -> 异步函数
+
 TOOL_REGISTRY = {
     "weather": get_weather,
     "news": get_news,
 }
 
-# 工具描述：用于 LLM 理解何时调用
+# OpenAI tools schema 格式。
+# type 固定为 "function"，function 内包含 name / description / parameters。
 TOOL_DESCRIPTIONS = {
     "weather": {
         "name": "weather",
-        "description": "查询指定城市的天气信息。当用户询问天气、温度、气候、是否下雨等情况时使用。",
+        "description": "查询指定城市的当前天气信息，包括温度、天气状况、体感温度和湿度。"
+                       "当用户询问天气、气温、是否下雨/下雪、冷热程度时必须使用此工具。",
         "parameters": {
             "type": "object",
             "properties": {
                 "city": {
                     "type": "string",
-                    "description": "要查询天气的城市名称，如'天津'、'北京'等"
+                    "description": "要查询天气的城市名称（中文），例如'北京'、'上海'、'天津'"
                 }
             },
             "required": ["city"]
@@ -30,11 +33,10 @@ TOOL_DESCRIPTIONS = {
     },
     "news": {
         "name": "news",
-        "description": "获取最新新闻资讯。当用户询问新闻、今日新闻、最新消息等情况时使用。",
+        "description": "获取最新的中文新闻头条资讯。当用户询问新闻、头条、最新消息、最近发生了什么时必须使用此工具。",
         "parameters": {
             "type": "object",
-            "properties": {},
-            "required": []
+            "properties": {}
         }
     },
 }
