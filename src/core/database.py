@@ -23,6 +23,18 @@ class Message:
     created_at: Optional[str] = None
 
 
+@dataclass
+class Reminder:
+    """提醒数据"""
+    id: int
+    title: str
+    content: str
+    remind_at: str
+    status: str
+    created_at: Optional[str] = None
+    triggered_at: Optional[str] = None
+
+
 class Database:
     """SQLite 数据库封装"""
 
@@ -57,6 +69,20 @@ class Database:
                     ON messages(session_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_created
                     ON messages(created_at);
+
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    content TEXT DEFAULT '',
+                    remind_at DATETIME NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'triggered', 'completed', 'cancelled')),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    triggered_at DATETIME
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_reminders_status_time
+                    ON reminders(status, remind_at);
             """)
             conn.execute("PRAGMA foreign_keys = ON;")
 
@@ -198,3 +224,99 @@ class Database:
                 (session_id,)
             )
             return cursor.fetchone()[0]
+
+    # ===== 提醒管理 =====
+
+    def create_reminder(
+        self,
+        title: str,
+        remind_at: str,
+        content: str = "",
+    ) -> int:
+        """创建提醒"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """INSERT INTO reminders (title, content, remind_at, status)
+                   VALUES (?, ?, ?, 'pending')""",
+                (title, content, remind_at),
+            )
+            return cursor.lastrowid
+
+    def get_pending_reminders(self) -> List[Reminder]:
+        """获取所有未触发提醒"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, title, content, remind_at, status, created_at, triggered_at
+                   FROM reminders
+                   WHERE status = 'pending'
+                   ORDER BY remind_at ASC"""
+            ).fetchall()
+            return [Reminder(**dict(row)) for row in rows]
+
+    def get_reminder(self, reminder_id: int) -> Optional[Reminder]:
+        """获取单个提醒"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT id, title, content, remind_at, status, created_at, triggered_at
+                   FROM reminders
+                   WHERE id = ?""",
+                (reminder_id,),
+            ).fetchone()
+            return Reminder(**dict(row)) if row else None
+
+    def list_reminders(self, include_cancelled: bool = False) -> List[Reminder]:
+        """列出提醒"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if include_cancelled:
+                rows = conn.execute(
+                    """SELECT id, title, content, remind_at, status, created_at, triggered_at
+                       FROM reminders
+                       ORDER BY remind_at DESC"""
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, title, content, remind_at, status, created_at, triggered_at
+                       FROM reminders
+                       WHERE status != 'cancelled'
+                       ORDER BY remind_at DESC"""
+                ).fetchall()
+            return [Reminder(**dict(row)) for row in rows]
+
+    def mark_reminder_triggered(self, reminder_id: int) -> None:
+        """标记提醒已触发"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """UPDATE reminders
+                   SET status = 'triggered', triggered_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (reminder_id,),
+            )
+
+    def reschedule_reminder(self, reminder_id: int, remind_at: str) -> None:
+        """重新安排提醒时间"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """UPDATE reminders
+                   SET remind_at = ?, status = 'pending', triggered_at = NULL
+                   WHERE id = ?""",
+                (remind_at, reminder_id),
+            )
+
+    def complete_reminder(self, reminder_id: int) -> None:
+        """标记提醒已完成"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE reminders SET status = 'completed' WHERE id = ?",
+                (reminder_id,),
+            )
+
+    def cancel_reminder(self, reminder_id: int) -> None:
+        """取消提醒"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE reminders SET status = 'cancelled' WHERE id = ?",
+                (reminder_id,),
+            )

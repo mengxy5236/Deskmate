@@ -1,71 +1,116 @@
-import asyncio
-from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from typing import Callable, Optional
+
 from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
 
-from src.modules.weather import get_weather
-from src.modules.news import get_news
+from src.core.database import Database, Reminder
 
-
-def sync_weather():
-    """同步执行异步天气查询（APScheduler 需要同步函数）"""
-    result = asyncio.run(get_weather("Tianjin"))
-    print(f"[天气推送] {datetime.now()}:\n{result}")
-    # 这里可以调用 plyer 发送桌面通知
+logger = logging.getLogger(__name__)
 
 
-def sync_news():
-    """同步执行异步新闻查询"""
-    result = asyncio.run(get_news())
-    print(f"[新闻推送] {datetime.now()}:\n{result}")
+class ReminderScheduler:
+    """提醒调度器，负责恢复和触发单次提醒。"""
 
+    def __init__(
+        self,
+        db: Database,
+        on_trigger: Callable[[Reminder], None],
+    ) -> None:
+        self._db = db
+        self._on_trigger = on_trigger
+        self._scheduler = BackgroundScheduler(
+            executors={"default": ThreadPoolExecutor(4)},
+            job_defaults={"coalesce": False, "max_instances": 1},
+        )
 
-def create_scheduler():
-    """创建调度器"""
-    # 1. 配置执行器（线程池）
-    executors = {
-        'default': ThreadPoolExecutor(10)
-    }
+    def start(self) -> None:
+        if not self._scheduler.running:
+            self._scheduler.start()
+        self.restore_pending_reminders()
 
-    # 2. 创建调度器（后台运行，适合 GUI 应用）
-    scheduler = BackgroundScheduler(
-        executors=executors,
-        jobstore_defaults={'coalesce': False, 'max_instances': 3}
-    )
+    def shutdown(self) -> None:
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=False)
 
-    # 4. 添加定时任务
-    # 每天早上 8 点推送天气
-    scheduler.add_job(
-        sync_weather,
-        'cron',
-        hour=8, minute=0,
-        id='daily_weather',
-        replace_existing=True  # 任务存在时替换
-    )
+    def restore_pending_reminders(self) -> None:
+        for reminder in self._db.get_pending_reminders():
+            self.schedule_existing(reminder)
 
-    # 每 8 小时推送新闻
-    scheduler.add_job(
-        sync_news,
-        'interval',
-        hours=8,
-        id='hourly_news',
-        replace_existing=True
-    )
+    def create_reminder(
+        self,
+        title: str,
+        remind_at: datetime,
+        content: str = "",
+    ) -> Reminder:
+        reminder_id = self._db.create_reminder(
+            title=title,
+            content=content,
+            remind_at=remind_at.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        reminder = self._db.get_reminder(reminder_id)
+        if reminder is None:
+            raise RuntimeError("Failed to load created reminder")
+        self.schedule_existing(reminder)
+        return reminder
 
-    # 5. 启动调度器
-    scheduler.start()
-    print("调度器已启动！")
+    def schedule_existing(self, reminder: Reminder) -> None:
+        run_at = datetime.strptime(reminder.remind_at, "%Y-%m-%d %H:%M:%S")
+        if run_at <= datetime.now():
+            self._fire_reminder(reminder.id)
+            return
 
-    return scheduler
+        self._scheduler.add_job(
+            self._fire_reminder,
+            trigger=DateTrigger(run_date=run_at),
+            args=[reminder.id],
+            id=self._job_id(reminder.id),
+            replace_existing=True,
+        )
 
+    def cancel_reminder(self, reminder_id: int) -> None:
+        self._db.cancel_reminder(reminder_id)
+        self._remove_job(reminder_id)
 
-if __name__ == "__main__":
-    scheduler = create_scheduler()
+    def complete_reminder(self, reminder_id: int) -> None:
+        self._db.complete_reminder(reminder_id)
+        self._remove_job(reminder_id)
 
-    # 保持程序运行
-    try:
-        while True:
-            pass
-    except KeyboardInterrupt:
-        scheduler.shutdown()
-        print("调度器已关闭")
+    def snooze_reminder(self, reminder_id: int, minutes: int = 10) -> Optional[Reminder]:
+        reminder = self._db.get_reminder(reminder_id)
+        if reminder is None:
+            return None
+
+        remind_at = datetime.now() + timedelta(minutes=minutes)
+        self._db.reschedule_reminder(
+            reminder_id,
+            remind_at.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        latest = self._db.get_reminder(reminder_id)
+        if latest is None:
+            return None
+        self.schedule_existing(latest)
+        return latest
+
+    def _remove_job(self, reminder_id: int) -> None:
+        try:
+            self._scheduler.remove_job(self._job_id(reminder_id))
+        except Exception as exc:
+            logger.debug("Failed to remove reminder job %s: %s", reminder_id, exc)
+
+    def _job_id(self, reminder_id: int) -> str:
+        return f"reminder:{reminder_id}"
+
+    def _fire_reminder(self, reminder_id: int) -> None:
+        reminder = self._db.get_reminder(reminder_id)
+        if reminder is None or reminder.status != "pending":
+            return
+
+        self._db.mark_reminder_triggered(reminder_id)
+        latest = self._db.get_reminder(reminder_id)
+        if latest is not None:
+            self._on_trigger(latest)

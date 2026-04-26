@@ -12,7 +12,9 @@ Deskmate 气泡助手 —— 微信式对话架构
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
+from datetime import datetime, timedelta
 from PyQt6.QtCore import (
     Qt, QThread, QTimer, pyqtSignal, QPoint, QRect,
 )
@@ -25,10 +27,14 @@ from PyQt6.QtWidgets import (
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
     QMenu, QSystemTrayIcon, QGridLayout,
     QScrollArea, QVBoxLayout, QHBoxLayout,
-    QFrame, QSizePolicy,
+    QFrame, QSizePolicy, QListWidget, QListWidgetItem,
+    QTextEdit, QMessageBox, QDialog, QDialogButtonBox,
+    QDateTimeEdit,
 )
 
 from src.core.chat_backend import ChatBackend
+from src.services.reminder_service import ReminderCommandResult, ReminderService
+from src.services.session_service import SessionService
 from src.ui.cat_animation import CatAnimation
 
 
@@ -80,6 +86,124 @@ THEMES = [
     ("#6366F1", "#3B82F6"),
 ]
 
+HISTORY_PANEL_STYLESHEET = """
+QWidget {
+    background: #e7e1d7;
+    color: #2f312d;
+    border: none;
+}
+QFrame#historyCard {
+    background: #f8f4ed;
+    border: 1px solid #d7cec1;
+    border-radius: 18px;
+}
+QFrame#titleBar {
+    background: #efe7db;
+    border: 1px solid #ddd2c3;
+    border-radius: 14px;
+}
+QLabel#historyTitle {
+    color: #2f312d;
+    font-size: 18px;
+    font-weight: 700;
+}
+QLabel#historySubtitle {
+    color: #6f736b;
+    font-size: 12px;
+}
+QListWidget {
+    background: #fdfbf8;
+    border: 1px solid #ddd2c3;
+    border-radius: 14px;
+    padding: 6px;
+    outline: none;
+}
+QListWidget::item {
+    background: transparent;
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 3px 0;
+    color: #2f312d;
+}
+QListWidget::item:selected {
+    background: #dde4d8;
+}
+QListWidget::item:hover {
+    background: #ece7df;
+}
+QTextEdit {
+    background: #fdfbf8;
+    border: 1px solid #ddd2c3;
+    border-radius: 14px;
+    color: #2f312d;
+    padding: 12px;
+    selection-background-color: #d9ddd7;
+}
+QPushButton {
+    background: #d9dfd2;
+    color: #2f312d;
+    border: 1px solid #c4ccbc;
+    border-radius: 12px;
+    padding: 10px 16px;
+}
+QPushButton:hover {
+    background: #cfd7c7;
+}
+QPushButton:pressed {
+    background: #c3ccb9;
+}
+QLineEdit, QDateTimeEdit {
+    background: #fdfbf8;
+    border: 1px solid #ddd2c3;
+    border-radius: 14px;
+    color: #2f312d;
+    padding: 12px 14px;
+    font-size: 16px;
+    selection-background-color: #d9ddd7;
+}
+QLineEdit::placeholder {
+    color: #8a8d86;
+}
+QDateTimeEdit::drop-down {
+    width: 30px;
+    border: none;
+    background: transparent;
+}
+QDateTimeEdit::down-arrow {
+    width: 12px;
+    height: 12px;
+}
+"""
+
+REMINDER_PANEL_STYLESHEET = HISTORY_PANEL_STYLESHEET
+
+
+class DraggableFramelessMixin:
+    """给无边框窗口提供基础拖动能力。"""
+
+    def _init_drag_state(self) -> None:
+        self._drag_active = False
+        self._drag_offset = QPoint()
+        self._drag_handles: list[QWidget] = []
+
+    def _register_drag_handle(self, widget: QWidget) -> None:
+        self._drag_handles.append(widget)
+        widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched in self._drag_handles:
+            if event.type() == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._drag_active = True
+                self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                return True
+            if event.type() == event.Type.MouseMove and self._drag_active and (event.buttons() & Qt.MouseButton.LeftButton):
+                self.move(event.globalPosition().toPoint() - self._drag_offset)
+                return True
+            if event.type() == event.Type.MouseButtonRelease:
+                self._drag_active = False
+                return True
+        return super().eventFilter(watched, event)
+
 
 def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
     h = hex_str.lstrip('#')
@@ -117,7 +241,7 @@ class StreamingWorker(QThread):
             finally:
                 loop.close()
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(self._format_error_message(exc))
 
     async def _consume(self) -> None:
         full = ""
@@ -125,6 +249,16 @@ class StreamingWorker(QThread):
             full += token
             self.chunk.emit(token)
         self.done.emit(full)
+
+    @staticmethod
+    def _format_error_message(exc: Exception) -> str:
+        message = str(exc).strip()
+        if message:
+            return message
+        exc_repr = repr(exc).strip()
+        if exc_repr and exc_repr != f"{exc.__class__.__name__}()":
+            return exc_repr
+        return exc.__class__.__name__
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -257,6 +391,395 @@ class SettingsPanel(QWidget):
 
     def hide_panel(self) -> None:
         self.hide()
+
+
+class HistoryWindow(DraggableFramelessMixin, QWidget):
+
+    preview_requested = pyqtSignal(int)
+    session_selected = pyqtSignal(int)
+    new_session_requested = pyqtSignal()
+    delete_session_requested = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._init_drag_state()
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        self.setWindowTitle("Deskmate History")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.resize(920, 620)
+        self.setStyleSheet(HISTORY_PANEL_STYLESHEET)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(0)
+
+        card = QFrame(self)
+        card.setObjectName("historyCard")
+        outer.addWidget(card)
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        title = QLabel("多轮对话")
+        title.setObjectName("historyTitle")
+        title_bar = QFrame(self)
+        title_bar.setObjectName("titleBar")
+        header = QHBoxLayout(title_bar)
+        header.setContentsMargins(14, 10, 10, 10)
+        header.setSpacing(8)
+        header.addWidget(title)
+        header.addStretch(1)
+
+        close_btn = QPushButton("x")
+        close_btn.setFixedSize(34, 34)
+        close_btn.clicked.connect(self.close)
+        header.addWidget(close_btn)
+        layout.addWidget(title_bar)
+        self._register_drag_handle(title_bar)
+
+        subtitle = QLabel("查看历史会话，切换上下文，继续之前的聊天。")
+        subtitle.setObjectName("historySubtitle")
+        layout.addWidget(subtitle)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        layout.addLayout(body, 1)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        body.addLayout(left, 2)
+
+        self._session_list = QListWidget(self)
+        self._session_list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._session_list.itemDoubleClicked.connect(self._on_item_activated)
+        left.addWidget(self._session_list, 1)
+
+        left_buttons = QHBoxLayout()
+        left_buttons.setSpacing(8)
+        left.addLayout(left_buttons)
+
+        new_btn = QPushButton("新建对话")
+        new_btn.clicked.connect(self.new_session_requested.emit)
+        left_buttons.addWidget(new_btn)
+
+        open_btn = QPushButton("继续对话")
+        open_btn.clicked.connect(self._emit_current_selection)
+        left_buttons.addWidget(open_btn)
+
+        delete_btn = QPushButton("删除")
+        delete_btn.clicked.connect(self._delete_current_selection)
+        left_buttons.addWidget(delete_btn)
+
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        body.addLayout(right, 3)
+
+        preview_title = QLabel("会话内容预览")
+        preview_title.setObjectName("historySubtitle")
+        right.addWidget(preview_title)
+
+        self._preview = QTextEdit(self)
+        self._preview.setReadOnly(True)
+        self._preview.setPlaceholderText("选择左侧会话后，这里会显示聊天记录。")
+        right.addWidget(self._preview, 1)
+
+    def populate_sessions(self, sessions: list[dict], current_session_id: int | None = None) -> None:
+        self._session_list.blockSignals(True)
+        self._session_list.clear()
+        for session in sessions:
+            label = session["title"]
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, session["id"])
+            item.setToolTip(
+                f'{session["title"]}\n创建: {session["created_at"]}\n更新: {session["updated_at"]}'
+            )
+            self._session_list.addItem(item)
+            if current_session_id is not None and session["id"] == current_session_id:
+                self._session_list.setCurrentItem(item)
+        self._session_list.blockSignals(False)
+
+    def set_preview(self, messages: list) -> None:
+        if not messages:
+            self._preview.setPlainText("这个会话还没有消息。")
+            return
+
+        blocks: list[str] = []
+        for msg in messages:
+            role = "你" if msg.role == "user" else "助手"
+            blocks.append(f"{role}\n{msg.content}")
+        self._preview.setPlainText("\n\n".join(blocks))
+        cursor = self._preview.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self._preview.setTextCursor(cursor)
+
+    def show_near_cursor(self) -> None:
+        screen = QApplication.primaryScreen().availableGeometry()
+        pos = QCursor.pos()
+        x = min(max(screen.left() + 20, pos.x() - self.width() // 2), screen.right() - self.width() - 20)
+        y = min(max(screen.top() + 20, pos.y() - self.height() // 3), screen.bottom() - self.height() - 20)
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_selection_changed(self) -> None:
+        item = self._session_list.currentItem()
+        if item is None:
+            self._preview.clear()
+            return
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        self.preview_requested.emit(session_id)
+
+    def _on_item_activated(self, item: QListWidgetItem) -> None:
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        self.session_selected.emit(session_id)
+
+    def _emit_current_selection(self) -> None:
+        item = self._session_list.currentItem()
+        if item is None:
+            return
+        self.session_selected.emit(item.data(Qt.ItemDataRole.UserRole))
+
+    def _delete_current_selection(self) -> None:
+        item = self._session_list.currentItem()
+        if item is None:
+            return
+        self.delete_session_requested.emit(item.data(Qt.ItemDataRole.UserRole))
+
+
+class ReminderCreateDialog(DraggableFramelessMixin, QDialog):
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._init_drag_state()
+        self.setWindowTitle("新建提醒")
+        self.setModal(True)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Dialog
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.resize(420, 260)
+        self.setStyleSheet(REMINDER_PANEL_STYLESHEET)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title = QLabel("创建提醒")
+        title.setObjectName("historyTitle")
+        title_bar = QFrame(self)
+        title_bar.setObjectName("titleBar")
+        header = QHBoxLayout(title_bar)
+        header.setContentsMargins(14, 10, 10, 10)
+        header.setSpacing(8)
+        header.addWidget(title)
+        header.addStretch(1)
+
+        close_btn = QPushButton("x")
+        close_btn.setFixedSize(34, 34)
+        close_btn.clicked.connect(self.reject)
+        header.addWidget(close_btn)
+        layout.addWidget(title_bar)
+        self._register_drag_handle(title_bar)
+
+        self._title_input = QLineEdit(self)
+        self._title_input.setPlaceholderText("提醒标题，例如：提交验收材料")
+        layout.addWidget(self._title_input)
+
+        self._content_input = QTextEdit(self)
+        self._content_input.setPlaceholderText("补充说明，可选")
+        self._content_input.setFixedHeight(90)
+        layout.addWidget(self._content_input)
+
+        self._time_input = QDateTimeEdit(self)
+        self._time_input.setCalendarPopup(True)
+        self._time_input.setDateTime(datetime.now() + timedelta(minutes=10))
+        self._time_input.setDisplayFormat("yyyy-MM-dd HH:mm")
+        layout.addWidget(self._time_input)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_payload(self) -> tuple[str, str, datetime]:
+        return (
+            self._title_input.text().strip(),
+            self._content_input.toPlainText().strip(),
+            self._time_input.dateTime().toPyDateTime(),
+        )
+
+
+class ReminderWindow(DraggableFramelessMixin, QWidget):
+
+    create_requested = pyqtSignal()
+    snooze_requested = pyqtSignal(int)
+    complete_requested = pyqtSignal(int)
+    cancel_requested = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._init_drag_state()
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        self.setWindowTitle("Reminders")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.resize(920, 620)
+        self.setStyleSheet(REMINDER_PANEL_STYLESHEET)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(0)
+
+        card = QFrame(self)
+        card.setObjectName("historyCard")
+        outer.addWidget(card)
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        title = QLabel("提醒与待办")
+        title.setObjectName("historyTitle")
+        title_bar = QFrame(self)
+        title_bar.setObjectName("titleBar")
+        header = QHBoxLayout(title_bar)
+        header.setContentsMargins(14, 10, 10, 10)
+        header.setSpacing(8)
+        header.addWidget(title)
+        header.addStretch(1)
+
+        close_btn = QPushButton("x")
+        close_btn.setFixedSize(34, 34)
+        close_btn.clicked.connect(self.close)
+        header.addWidget(close_btn)
+        layout.addWidget(title_bar)
+        self._register_drag_handle(title_bar)
+
+        subtitle = QLabel("创建、查看和处理即将到来的提醒。")
+        subtitle.setObjectName("historySubtitle")
+        layout.addWidget(subtitle)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        layout.addLayout(body, 1)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        body.addLayout(left, 2)
+
+        self._list = QListWidget(self)
+        self._list.itemSelectionChanged.connect(self._refresh_detail)
+        left.addWidget(self._list, 1)
+
+        left_buttons = QHBoxLayout()
+        left_buttons.setSpacing(8)
+        left.addLayout(left_buttons)
+
+        new_btn = QPushButton("新建提醒")
+        new_btn.clicked.connect(self.create_requested.emit)
+        left_buttons.addWidget(new_btn)
+
+        snooze_btn = QPushButton("稍后10分钟")
+        snooze_btn.clicked.connect(self._snooze_current)
+        left_buttons.addWidget(snooze_btn)
+
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        body.addLayout(right, 3)
+
+        self._detail = QTextEdit(self)
+        self._detail.setReadOnly(True)
+        self._detail.setPlaceholderText("选择左侧提醒后，这里会显示详情。")
+        right.addWidget(self._detail, 1)
+
+        right_buttons = QHBoxLayout()
+        right_buttons.setSpacing(8)
+        right.addLayout(right_buttons)
+
+        complete_btn = QPushButton("完成")
+        complete_btn.clicked.connect(self._complete_current)
+        right_buttons.addWidget(complete_btn)
+
+        cancel_btn = QPushButton("删除")
+        cancel_btn.clicked.connect(self._cancel_current)
+        right_buttons.addWidget(cancel_btn)
+
+    def populate(self, reminders: list) -> None:
+        self._list.clear()
+        for reminder in reminders:
+            item = QListWidgetItem(f"[{reminder.status}] {reminder.title}")
+            item.setData(Qt.ItemDataRole.UserRole, reminder)
+            self._list.addItem(item)
+        if self._list.count() > 0 and self._list.currentRow() < 0:
+            self._list.setCurrentRow(0)
+        else:
+            self._refresh_detail()
+
+    def show_near_cursor(self) -> None:
+        screen = QApplication.primaryScreen().availableGeometry()
+        pos = QCursor.pos()
+        x = min(max(screen.left() + 20, pos.x() - self.width() // 2), screen.right() - self.width() - 20)
+        y = min(max(screen.top() + 20, pos.y() - self.height() // 3), screen.bottom() - self.height() - 20)
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _current_reminder(self):
+        item = self._list.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _refresh_detail(self) -> None:
+        reminder = self._current_reminder()
+        if reminder is None:
+            self._detail.clear()
+            return
+
+        lines = [
+            f"标题：{reminder.title}",
+            f"状态：{reminder.status}",
+            f"提醒时间：{reminder.remind_at}",
+        ]
+        if reminder.content:
+            lines.append("")
+            lines.append(reminder.content)
+        self._detail.setPlainText("\n".join(lines))
+
+    def _snooze_current(self) -> None:
+        reminder = self._current_reminder()
+        if reminder is not None:
+            self.snooze_requested.emit(reminder.id)
+
+    def _complete_current(self) -> None:
+        reminder = self._current_reminder()
+        if reminder is not None:
+            self.complete_requested.emit(reminder.id)
+
+    def _cancel_current(self) -> None:
+        reminder = self._current_reminder()
+        if reminder is not None:
+            self.cancel_requested.emit(reminder.id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -396,6 +919,7 @@ class ChatBubble(QFrame):
 
         self._apply_theme()
         self.set_opacity(opacity_factor)
+        self._refresh_bubble_layout()
 
     def _apply_theme(self) -> None:
         if self._role == "user":
@@ -425,9 +949,23 @@ class ChatBubble(QFrame):
     def append_text(self, chunk: str) -> None:
         self._text += chunk
         self._label.setText(self._text)
+        self._refresh_bubble_layout()
+
+    def _refresh_bubble_layout(self) -> None:
         self._label.setMaximumWidth(self.MAX_W - 20)
+        self._label.adjustSize()
+        if self.layout() is not None:
+            self.layout().invalidate()
+            self.layout().activate()
+        self.adjustSize()
+        self.updateGeometry()
         if self.height() < self.MIN_H:
             self.setMinimumHeight(self.MIN_H)
+        if self.parentWidget() is not None:
+            self.parentWidget().updateGeometry()
+            if self.parentWidget().layout() is not None:
+                self.parentWidget().layout().invalidate()
+                self.parentWidget().layout().activate()
 
     @staticmethod
     def estimate_height(text: str, max_w: int) -> int:
@@ -608,6 +1146,23 @@ class ChatMessageList(QWidget):
         self._recompute_and_scroll()
         return bubble
 
+    def add_message(self, role: str, text: str) -> None:
+        bubble = ChatBubble(
+            text,
+            role,
+            opacity_factor=1.0,
+            theme_user=self._theme_user,
+            theme_assistant=self._theme_assistant,
+        )
+        self._add_row(bubble)
+        self._refresh_opacities()
+        self._recompute_and_scroll()
+
+    def load_history(self, messages: list, limit: int = 20) -> None:
+        self.clear_messages()
+        for msg in messages[-limit:]:
+            self.add_message(msg.role, msg.content)
+
     def append_to_pending(self, chunk: str) -> None:
         self._pending_chunks.append(chunk)
         if self._pending_bubble is None:
@@ -628,11 +1183,13 @@ class ChatMessageList(QWidget):
         self._pending_bubble.append_text(joined)
         self._recompute_and_scroll()
 
-    def finalize_pending(self) -> None:
+    def finalize_pending(self, drop_if_empty: bool = False) -> None:
         if self._pending_chunks and self._pending_bubble:
             joined = "".join(self._pending_chunks)
             self._pending_chunks.clear()
             self._pending_bubble.append_text(joined)
+        elif drop_if_empty and self._pending_bubble is not None and not self._pending_bubble._text.strip():
+            self._remove_bubble(self._pending_bubble)
         self._pending_bubble = None
         self._recompute_and_scroll()
 
@@ -657,6 +1214,14 @@ class ChatMessageList(QWidget):
         insert_idx = self._container_layout.count() - 1
         self._container_layout.insertLayout(insert_idx, row)
         self._messages.append(bubble)
+
+    def _remove_bubble(self, bubble: ChatBubble) -> None:
+        if bubble not in self._messages:
+            return
+        row_idx = self._messages.index(bubble)
+        self._remove_row(row_idx)
+        self._messages.pop(row_idx)
+        bubble.deleteLater()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -769,6 +1334,12 @@ class InputPanel(QWidget):
         self.hide()
         self._msg_list._input.clear()
 
+    def set_busy(self, busy: bool) -> None:
+        self._msg_list._input.setEnabled(not busy)
+        self._msg_list._input.setPlaceholderText("正在请求回复..." if busy else "Message...")
+        if not busy:
+            self._msg_list._input.setFocus()
+
     def follow_star(self) -> None:
         if self.isVisible():
             self.move(self._compute_final_pos())
@@ -806,6 +1377,7 @@ class InputPanel(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BubbleWindow(QWidget):
+    reminder_triggered = pyqtSignal(object)
     MARGIN = 24
     _ICON_SIZE = 64
 
@@ -813,17 +1385,33 @@ class BubbleWindow(QWidget):
         super().__init__()
 
         self._backend = ChatBackend()
-        self._session_id: int | None = None
         self._stream_worker: StreamingWorker | None = None
         self._current_theme_idx = 0
+        self._tray_flash_timer: QTimer | None = None
+        self._tray_flash_steps = 0
+        self._tray_icon_visible = True
+        self._tray_icon_default = QIcon(CatAnimation(self._ICON_SIZE).get_current_frame())
+        blank = QPixmap(self._ICON_SIZE, self._ICON_SIZE)
+        blank.fill(Qt.GlobalColor.transparent)
+        self._tray_icon_blank = QIcon(blank)
+        self._reminder_service = ReminderService(
+            db=self._backend.db,
+            on_trigger=self._handle_scheduler_trigger,
+        )
+        self._session_service = SessionService(self._backend)
 
         self._state = "rest"
+        self.reminder_triggered.connect(self._display_reminder)
 
         self._setup_window()
         self._build_star_button()
         self._build_input()
         self._build_settings_panel()
+        self._build_history_window()
+        self._build_reminder_window()
         self._setup_tray()
+        self._configure_tray_menu()
+        self._reminder_service.start()
 
     def _setup_window(self) -> None:
         screen = QApplication.primaryScreen().availableGeometry()
@@ -890,9 +1478,25 @@ class BubbleWindow(QWidget):
         self._settings_panel.hide()
         self._settings_panel.theme_changed.connect(self._on_theme_changed)
 
+    def _build_history_window(self) -> None:
+        self._history_window = HistoryWindow(self)
+        self._history_window.hide()
+        self._history_window.preview_requested.connect(self._preview_session)
+        self._history_window.session_selected.connect(self._show_session)
+        self._history_window.new_session_requested.connect(self._create_new_session)
+        self._history_window.delete_session_requested.connect(self._delete_session)
+
+    def _build_reminder_window(self) -> None:
+        self._reminder_window = ReminderWindow(self)
+        self._reminder_window.hide()
+        self._reminder_window.create_requested.connect(self._show_create_reminder_dialog)
+        self._reminder_window.snooze_requested.connect(self._snooze_reminder)
+        self._reminder_window.complete_requested.connect(self._complete_reminder)
+        self._reminder_window.cancel_requested.connect(self._cancel_reminder)
+
     def _setup_tray(self) -> None:
         self._tray = QSystemTrayIcon(self)
-        self._tray.setIcon(QIcon(CatAnimation(self._ICON_SIZE).get_current_frame()))
+        self._tray.setIcon(self._tray_icon_default)
         self._tray.setToolTip("气泡助手")
         menu = QMenu(self)
         menu.addAction("打开", self._show_window)
@@ -927,6 +1531,13 @@ class BubbleWindow(QWidget):
     def _on_theme_changed(self, user: str, assistant: str) -> None:
         self._input._msg_list.set_theme(user, assistant)
 
+    def _show_settings_panel(self) -> None:
+        self._settings_panel.show_at_star(self._star_geometry())
+
+    def _show_history_window(self) -> None:
+        self._refresh_history_window()
+        self._history_window.show_near_cursor()
+
     def _show_window(self) -> None:
         if self._state == "rest":
             self._activate_input()
@@ -950,6 +1561,186 @@ class BubbleWindow(QWidget):
             if self._input.isVisible() and self._input.geometry().contains(self.mapFromGlobal(gp)):
                 self._show_theme_menu()
                 return
+
+    def _on_star_clicked(self) -> None:
+        if self._state == "active":
+            self._star.set_animation_state('idle')
+        else:
+            self._star.set_animation_state('sleeping')
+
+    def _activate_input(self) -> None:
+        self._state = "active"
+        if self._session_service.current_session_id is None:
+            self._create_new_session()
+        self._input.show_input()
+        self._star.set_animation_state('idle')
+
+    def _on_input_cancel(self) -> None:
+        if self._state != "active":
+            return
+        self._input.hide_input()
+        self._state = "rest"
+        self._star.set_animation_state('sleeping')
+
+    def _on_send(self, content: str) -> None:
+        if not content:
+            return
+        if self._stream_worker and self._stream_worker.isRunning():
+            return
+        session_id = self._session_service.ensure_session()
+
+        self._input._msg_list.add_user_bubble(content)
+        command_result = self._handle_local_reminder_command(content)
+        if command_result.handled:
+            self._session_service.add_message("user", content)
+            self._input._msg_list.add_message("assistant", command_result.reply)
+            self._session_service.add_message("assistant", command_result.reply)
+            self._refresh_history_window()
+            self._refresh_reminder_window()
+            return
+        self._input.set_busy(True)
+        self._input._msg_list.add_assistant_bubble()
+        self._call_stream(content, session_id)
+
+    def _call_stream(self, content: str, session_id: int) -> None:
+        if self._stream_worker and self._stream_worker.isRunning():
+            return
+        self._stream_worker = StreamingWorker(
+            backend=self._backend,
+            prompt=content,
+            session_id=session_id,
+        )
+        self._stream_worker.chunk.connect(self._on_stream_chunk)
+        self._stream_worker.done.connect(self._on_stream_done)
+        self._stream_worker.error.connect(self._on_error)
+        self._stream_worker.start()
+
+    def _on_stream_chunk(self, chunk: str) -> None:
+        self._input._msg_list.append_to_pending(chunk)
+
+    def _on_stream_done(self, full_text: str) -> None:
+        self._input._msg_list.finalize_pending()
+        self._input.set_busy(False)
+        self._refresh_history_window()
+        self._stream_worker = None
+
+    def _on_error(self, err: str) -> None:
+        self._input._msg_list.finalize_pending(drop_if_empty=True)
+        detail = err.strip() if err and err.strip() else "未知错误"
+        error_text = f"抱歉，当前模型请求失败：{detail}"
+        self._input._msg_list.add_message("assistant", error_text)
+        self._session_service.add_message("assistant", error_text)
+        self._input.set_busy(False)
+        self._refresh_history_window()
+        self._stream_worker = None
+
+    def _refresh_history_window(self) -> None:
+        current_session_id = self._session_service.current_session_id
+        sessions = self._session_service.get_recent_sessions()
+        self._history_window.populate_sessions(sessions, current_session_id)
+        if current_session_id is not None:
+            self._history_window.set_preview(self._session_service.get_current_history())
+        else:
+            self._history_window.set_preview([])
+
+    def _create_new_session(self) -> None:
+        self._session_service.create_new_session()
+        self._input._msg_list.clear_messages()
+        self._refresh_history_window()
+
+    def _preview_session(self, session_id: int) -> None:
+        self._history_window.set_preview(self._session_service.preview_session(session_id))
+
+    def _show_session(self, session_id: int) -> None:
+        history = self._session_service.switch_session(session_id)
+        self._history_window.set_preview(history)
+        self._input._msg_list.load_history(history)
+        self._state = "active"
+        self._input.show_input()
+        self._star.set_animation_state('idle')
+        self._history_window.hide()
+
+    def _delete_session(self, session_id: int) -> None:
+        reply = QMessageBox.question(
+            self,
+            "删除会话",
+            "确定删除这个历史会话吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        result = self._session_service.delete_session(session_id)
+        if result.current_session_id is None:
+            self._input._msg_list.clear_messages()
+        else:
+            self._input._msg_list.load_history(result.current_history)
+        self._refresh_history_window()
+
+    def _create_test_reminder(self) -> None:
+        reminder = self._reminder_service.create_test_reminder(delay_seconds=10)
+        self._input._msg_list.add_message(
+            "assistant",
+            self._reminder_service.format_created_reply(reminder),
+        )
+        self._refresh_history_window()
+
+    def _handle_scheduler_trigger(self, reminder) -> None:
+        self.reminder_triggered.emit(reminder)
+
+    def _display_reminder(self, reminder) -> None:
+        self._state = "active"
+        if self._session_service.current_session_id is None:
+            self._create_new_session()
+        self._input.show_input()
+        self._star.set_animation_state("angry")
+        text = self._reminder_service.format_trigger_message(reminder)
+        self._input._msg_list.add_message("assistant", text)
+        self._session_service.add_message("assistant", text)
+        self._start_tray_flash()
+        self._tray.showMessage(
+            "Deskmate 提醒",
+            self._reminder_service.format_trigger_notification(reminder),
+            QSystemTrayIcon.MessageIcon.Information,
+            5000,
+        )
+        self._refresh_history_window()
+
+    def _start_tray_flash(self) -> None:
+        self._tray_flash_steps = 8
+        self._tray_icon_visible = False
+        if self._tray_flash_timer is None:
+            self._tray_flash_timer = QTimer(self)
+            self._tray_flash_timer.timeout.connect(self._toggle_tray_flash)
+        if not self._tray_flash_timer.isActive():
+            self._tray_flash_timer.start(420)
+
+    def _toggle_tray_flash(self) -> None:
+        self._tray.setIcon(self._tray_icon_default if self._tray_icon_visible else self._tray_icon_blank)
+        self._tray_icon_visible = not self._tray_icon_visible
+        self._tray_flash_steps -= 1
+        if self._tray_flash_steps <= 0 and self._tray_flash_timer is not None:
+            self._tray_flash_timer.stop()
+            self._tray.setIcon(self._tray_icon_default)
+            self._tray_icon_visible = True
+
+    def _handle_local_reminder_command(self, content: str) -> ReminderCommandResult:
+        return self._reminder_service.handle_chat_command(content)
+
+    def _configure_tray_menu(self) -> None:
+        menu = QMenu(self)
+        menu.addAction("打开聊天", self._show_window)
+        menu.addAction("多轮对话", self._show_history_window)
+        menu.addAction("提醒与待办", self._show_reminder_window)
+        menu.addSeparator()
+        menu.addAction("新建提醒", self._show_create_reminder_dialog)
+        menu.addAction("10秒后测试提醒", self._create_test_reminder)
+        menu.addSeparator()
+        menu.addAction("切换主题", self._show_theme_menu)
+        menu.addSeparator()
+        menu.addAction("退出", self.close)
+        self._tray.setContextMenu(menu)
 
     def _show_star_context_menu(self) -> None:
         menu = QMenu(self)
@@ -978,6 +1769,11 @@ class BubbleWindow(QWidget):
         """)
 
         menu.addAction("打开聊天")
+        menu.addAction("多轮对话")
+        menu.addAction("提醒与待办")
+        menu.addSeparator()
+        menu.addAction("新建提醒")
+        menu.addAction("10秒后测试提醒")
         menu.addSeparator()
         menu.addAction("切换主题")
         menu.addSeparator()
@@ -988,66 +1784,72 @@ class BubbleWindow(QWidget):
             text = action.text()
             if text == "打开聊天":
                 self._show_window()
+            elif text == "多轮对话":
+                self._show_history_window()
+            elif text == "提醒与待办":
+                self._show_reminder_window()
+            elif text == "新建提醒":
+                self._show_create_reminder_dialog()
+            elif text == "10秒后测试提醒":
+                self._create_test_reminder()
             elif text == "切换主题":
                 self._show_theme_menu()
             elif text == "退出":
                 self.close()
                 QApplication.instance().quit()
 
-    def _on_star_clicked(self) -> None:
-        if self._state == "active":
-            self._star.set_animation_state('idle')
-        else:
-            self._star.set_animation_state('sleeping')
+    def _show_reminder_window(self) -> None:
+        self._refresh_reminder_window()
+        self._reminder_window.show_near_cursor()
 
-    def _activate_input(self) -> None:
-        self._state = "active"
-        self._input.show_input()
-        self._star.set_animation_state('idle')
+    def _refresh_reminder_window(self) -> None:
+        self._reminder_window.populate(self._reminder_service.list_reminders())
 
-    def _on_input_cancel(self) -> None:
-        if self._state != "active":
+    def _show_create_reminder_dialog(self) -> None:
+        dialog = ReminderCreateDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self._input.hide_input()
-        self._state = "rest"
-        self._star.set_animation_state('sleeping')
 
-    def _on_send(self, content: str) -> None:
-        if not content:
+        title, content, remind_at = dialog.get_payload()
+        validation_error = self._reminder_service.validate_manual_reminder(title, remind_at)
+        if validation_error:
+            QMessageBox.warning(self, "提醒", validation_error)
             return
-        if self._session_id is None:
-            self._session_id = self._backend.create_session("气泡助手")
 
-        self._input._msg_list.add_user_bubble(content)
-        self._input._msg_list.add_assistant_bubble()
-        self._call_stream(content)
-
-    def _call_stream(self, content: str) -> None:
-        if self._stream_worker and self._stream_worker.isRunning():
-            return
-        self._stream_worker = StreamingWorker(
-            backend=self._backend,
-            prompt=content,
-            session_id=self._session_id,
+        reminder = self._reminder_service.create_reminder(
+            title=title,
+            content=content,
+            remind_at=remind_at,
         )
-        self._stream_worker.chunk.connect(self._on_stream_chunk)
-        self._stream_worker.done.connect(self._on_stream_done)
-        self._stream_worker.error.connect(self._on_error)
-        self._stream_worker.start()
+        self._input._msg_list.add_message(
+            "assistant",
+            self._reminder_service.format_created_reply(reminder),
+        )
+        self._refresh_reminder_window()
 
-    def _on_stream_chunk(self, chunk: str) -> None:
-        self._input._msg_list.append_to_pending(chunk)
+    def _snooze_reminder(self, reminder_id: int) -> None:
+        reminder = self._reminder_service.snooze_reminder(reminder_id, minutes=10)
+        if reminder is not None:
+            self._input._msg_list.add_message(
+                "assistant",
+                self._reminder_service.format_snoozed_reply(reminder, minutes=10),
+            )
+            self._refresh_reminder_window()
 
-    def _on_stream_done(self, full_text: str) -> None:
-        self._input._msg_list.finalize_pending()
-        self._stream_worker = None
+    def _complete_reminder(self, reminder_id: int) -> None:
+        self._reminder_service.complete_reminder(reminder_id)
+        self._refresh_reminder_window()
 
-    def _on_error(self, err: str) -> None:
-        self._input._msg_list.finalize_pending()
-        self._stream_worker = None
+    def _cancel_reminder(self, reminder_id: int) -> None:
+        self._reminder_service.cancel_reminder(reminder_id)
+        self._refresh_reminder_window()
 
     def closeEvent(self, e) -> None:
         self._tray.hide()
+        self._history_window.hide()
+        self._settings_panel.hide()
+        self._reminder_window.hide()
+        self._reminder_service.shutdown()
         if self._stream_worker and self._stream_worker.isRunning():
             self._stream_worker.quit()
             self._stream_worker.wait(1000)
