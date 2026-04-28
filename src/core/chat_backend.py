@@ -1,3 +1,4 @@
+import re
 from typing import List, Optional, AsyncIterator
 
 from src.core.database import Database, Message
@@ -25,6 +26,7 @@ class ChatBackend:
         history = self.db.get_history(session_id)
 
         reply = await self.router.process(content, self.llm, history, session_id)
+        reply = self._sanitize_reply(reply)
 
         self.db.add_message(session_id, "assistant", reply)
 
@@ -60,11 +62,31 @@ class ChatBackend:
         history = self.db.get_history(session_id)
 
         reply = await self.router.process(content, self.llm, history, session_id)
+        reply = self._sanitize_reply(reply)
 
         for chunk in _stream_text(reply):
             yield chunk
 
         self.db.add_message(session_id, "assistant", reply)
+
+    @staticmethod
+    def _sanitize_reply(reply: str) -> str:
+        cleaned = re.sub(r"<think>.*?</think>", "", reply, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = ChatBackend._strip_leading_reasoning(cleaned)
+        cleaned = cleaned.strip()
+        return cleaned or reply.strip()
+
+    @staticmethod
+    def _strip_leading_reasoning(text: str) -> str:
+        markers = (
+            "用户在", "用户询问", "用户想", "我需要", "我应该",
+            "根据系统提示", "不需要调用", "需要调用",
+        )
+        parts = re.split(r"\n\s*\n", text.strip())
+        while len(parts) > 1 and any(marker in parts[0] for marker in markers):
+            parts.pop(0)
+        return "\n\n".join(parts)
 
 
 def _stream_text(text: str, chunk_size: int = 3) -> AsyncIterator[str]:

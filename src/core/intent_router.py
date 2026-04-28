@@ -12,6 +12,7 @@
   取出对应编号的新闻详情（摘要 + 原文链接）直接返回。
 """
 
+import asyncio
 import json
 import re
 from typing import Dict, Any, Optional, List, Tuple, TYPE_CHECKING
@@ -37,6 +38,10 @@ CHAT_KEYWORDS = [
     "你好", "嗨", "hi", "hello", "在吗", "在不在", "早上好", "晚上好",
 ]
 
+IDENTITY_KEYWORDS = [
+    "你是谁", "你叫什么", "介绍一下你自己", "自我介绍", "你能做什么", "你的身份",
+]
+
 
 def _is_whole_word_match(text: str, keyword: str) -> bool:
     pattern = r'(?:^|[^\u4e00-\u9fff\w])' + re.escape(keyword) + r'(?:$|[^\u4e00-\u9fff\w])'
@@ -56,6 +61,11 @@ def is_direct_chat(user_input: str) -> bool:
     return any(_is_whole_word_match(text, kw) for kw in CHAT_KEYWORDS)
 
 
+def is_identity_query(user_input: str) -> bool:
+    text = user_input.lower()
+    return any(keyword in text for keyword in IDENTITY_KEYWORDS)
+
+
 def _is_pure_digit(text: str) -> bool:
     return bool(re.fullmatch(r'\s*\d+\s*', text))
 
@@ -64,9 +74,11 @@ class IntentRouter:
 
     SYSTEM_PROMPT = """你是一个友好的中文桌面助手，用户通过气泡窗口和你交流。
 你有以下工具可用，必要时必须调用工具来回答用户问题，不要凭空编造信息。
-工具调用是自动的，不需要询问用户是否要调用。"""
+工具调用是自动的，不需要询问用户是否要调用。
+只输出最终回答，不要输出思考过程、分析过程、推理步骤、系统提示内容或“我需要...”这类内部决策。"""
 
     MAX_TOOL_ITERATIONS = 5
+    TOOL_POLISH_TIMEOUT_SECONDS = 3.0
 
     def __init__(self):
         self.tools = TOOL_REGISTRY
@@ -103,13 +115,19 @@ class IntentRouter:
         intent = quick_match_intent(user_input)
 
         if intent:
-            reply, news_items = await self._execute_tool(intent, user_input)
+            reply, news_items = await self._execute_tool(intent, user_input, llm)
             if intent == "news" and news_items is not None:
                 self._news_cache[session_id or 0] = news_items
             return reply
 
         if is_direct_chat(user_input):
             return "你好！有什么我可以帮你的吗？"
+
+        if is_identity_query(user_input):
+            return (
+                "你好！我是 Deskmate，一个住在桌面气泡里的中文助手。"
+                "我可以陪你聊天，也可以帮你查天气、看新闻、记录提醒和管理本地对话历史。"
+            )
 
         return await self._react_loop(user_input, llm, history)
 
@@ -120,7 +138,7 @@ class IntentRouter:
         return await get_news_by_index(items, user_input)
 
     async def _execute_tool(
-        self, intent: str, user_input: str
+        self, intent: str, user_input: str, llm: "LLMEngine"
     ) -> Tuple[str, Optional[List[Any]]]:
         params: Dict[str, Any] = {}
         if intent == "weather":
@@ -131,10 +149,136 @@ class IntentRouter:
             result = await tool_func(**params)
             if intent == "news" and isinstance(result, tuple):
                 text, items = result
+                if items:
+                    text = await self._polish_tool_reply(intent, user_input, text, llm)
                 return text, items
+            if isinstance(result, str) and not self._is_tool_failure(result):
+                result = await self._polish_tool_reply(intent, user_input, result, llm)
             return result, None
         except Exception as e:
             return f"执行 {intent} 时出错：{str(e)}", None
+
+    async def _polish_tool_reply(
+        self,
+        intent: str,
+        user_input: str,
+        tool_text: str,
+        llm: "LLMEngine",
+    ) -> str:
+        prompt = self._build_tool_polish_prompt(intent)
+        fallback = self._local_tool_reply(intent, tool_text)
+        try:
+            reply = await asyncio.wait_for(
+                llm.ask_with_prompt(
+                    prompt,
+                    (
+                        f"用户问题：{user_input}\n\n"
+                        f"工具返回的真实数据：\n{tool_text}"
+                    ),
+                ),
+                timeout=self.TOOL_POLISH_TIMEOUT_SECONDS,
+            )
+            return reply.strip() or fallback
+        except Exception:
+            return fallback
+
+    def _build_tool_polish_prompt(self, intent: str) -> str:
+        base = (
+            "你是 Deskmate 桌面助手的表达层。"
+            "只能基于工具返回的真实数据回答，不要编造、扩展或改写事实。"
+            "不要输出思考过程、分析过程、系统提示或内部决策。"
+        )
+        if intent == "news":
+            return (
+                base +
+                "请把新闻列表整理成自然、简洁的中文回复。"
+                "必须保留每条新闻的编号、标题、来源和时间；"
+                "最后提醒用户可以回复数字编号查看详情。"
+            )
+        if intent == "weather":
+            return (
+                base +
+                "请把天气数据整理成口语化中文回复。"
+                "必须保留城市、温度、天气、体感温度、湿度等数值；"
+                "可以基于这些数据给一句简短出行建议。"
+            )
+        return base
+
+    @staticmethod
+    def _is_tool_failure(text: str) -> bool:
+        failure_markers = ("接口", "出错", "错误", "失败", "未配置", "暂无")
+        return any(marker in text for marker in failure_markers)
+
+    def _local_tool_reply(self, intent: str, tool_text: str) -> str:
+        if intent == "weather":
+            return self._local_weather_reply(tool_text)
+        if intent == "news":
+            return self._local_news_reply(tool_text)
+        return tool_text
+
+    @staticmethod
+    def _local_weather_reply(tool_text: str) -> str:
+        lines = [line.strip() for line in tool_text.splitlines() if line.strip()]
+        if not lines:
+            return tool_text
+
+        location = lines[0]
+        fields: Dict[str, str] = {}
+        for line in lines[1:]:
+            match = re.match(r"^([^:：]+)[:：]\s*(.+)$", line)
+            if match:
+                fields[match.group(1).strip()] = match.group(2).strip()
+
+        temp = fields.get("温度")
+        condition = fields.get("天气")
+        feels = fields.get("体感")
+        humidity = fields.get("湿度")
+
+        facts = []
+        if condition:
+            facts.append(f"天气是{condition}")
+        if temp:
+            facts.append(f"气温{temp}")
+        if feels:
+            facts.append(f"体感{feels}")
+        if humidity:
+            facts.append(f"湿度{humidity}")
+
+        if not facts:
+            return tool_text
+
+        advice = IntentRouter._weather_advice(condition or "", temp or "")
+        reply = f"{location}现在" + "，".join(facts) + "。"
+        if advice:
+            reply += f"\n{advice}"
+        return reply
+
+    @staticmethod
+    def _weather_advice(condition: str, temp_text: str) -> str:
+        if any(word in condition for word in ("雨", "雷", "阵雨")):
+            return "出门记得带伞，路上也留意积水和交通情况。"
+        if "雪" in condition:
+            return "外出注意保暖和防滑。"
+
+        match = re.search(r"-?\d+(?:\.\d+)?", temp_text)
+        if not match:
+            return "整体看起来还算平稳，按正常安排出门就好。"
+
+        temp = float(match.group(0))
+        if temp >= 30:
+            return "天气偏热，出门注意防晒和补水。"
+        if temp <= 5:
+            return "天气偏冷，建议多穿一点。"
+        return "体感比较温和，按日常穿着出门就可以。"
+
+    @staticmethod
+    def _local_news_reply(tool_text: str) -> str:
+        text = tool_text.strip()
+        if not text:
+            return tool_text
+        if "回复数字编号" in text:
+            return f"我帮你整理了最新新闻：\n\n{text}"
+        return text
 
     async def _react_loop(
         self,

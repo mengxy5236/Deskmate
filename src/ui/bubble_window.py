@@ -16,7 +16,7 @@ import re
 import sys
 from datetime import datetime, timedelta
 from PyQt6.QtCore import (
-    Qt, QThread, QTimer, pyqtSignal, QPoint, QRect,
+    Qt, QThread, QTimer, pyqtSignal, QPoint, QRect, QSize,
 )
 from PyQt6.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QFont, QFontMetrics,
@@ -39,81 +39,47 @@ from src.ui.cat_animation import CatAnimation
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 主题颜色定义
+# 主题颜色定义 (主题名, 用户气泡颜色, AI气泡颜色)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 THEMES = [
-    ("#484848", "#2C2C2E"),
-    ("#6366F1", "#8B5CF6"),
-    ("#3B82F6", "#10B981"),
-    ("#6366F1", "#EC4899"),
-    ("#8B5CF6", "#F59E0B"),
-    ("#14B8A6", "#6366F1"),
-    ("#F97316", "#8B5CF6"),
-    ("#EC4899", "#3B82F6"),
-    ("#10B981", "#F59E0B"),
-    ("#6366F1", "#14B8A6"),
-    ("#8B5CF6", "#EC4899"),
-    ("#3B82F6", "#F97316"),
-    ("#F59E0B", "#10B981"),
-    ("#14B8A6", "#EC4899"),
-    ("#6366F1", "#F59E0B"),
-    ("#8B5CF6", "#3B82F6"),
-    ("#EC4899", "#14B8A6"),
-    ("#10B981", "#6366F1"),
-    ("#F97316", "#EC4899"),
-    ("#3B82F6", "#8B5CF6"),
-    ("#F59E0B", "#6366F1"),
-    ("#14B8A6", "#F97316"),
-    ("#6366F1", "#10B981"),
-    ("#8B5CF6", "#14B8A6"),
-    ("#EC4899", "#F59E0B"),
-    ("#3B82F6", "#6366F1"),
-    ("#10B981", "#EC4899"),
-    ("#F97316", "#3B82F6"),
-    ("#6366F1", "#F97316"),
-    ("#8B5CF6", "#10B981"),
-    ("#F59E0B", "#8B5CF6"),
-    ("#14B8A6", "#6366F1"),
-    ("#EC4899", "#8B5CF6"),
-    ("#3B82F6", "#14B8A6"),
-    ("#6366F1", "#EC4899"),
-    ("#10B981", "#F59E0B"),
-    ("#8B5CF6", "#F97316"),
-    ("#F59E0B", "#EC4899"),
-    ("#14B8A6", "#3B82F6"),
-    ("#EC4899", "#6366F1"),
-    ("#6366F1", "#3B82F6"),
+    ("星蓝独白",   "#3B82F6", "#E5E7EB"),   # 星际蓝 + 冷浅灰
+    ("紫垣金穗",   "#7C3AED", "#FBBF24"),   # 藤萝紫 + 麦芽黄
+    ("碧苔珊瑚",   "#14B8A6", "#F87171"),   # 松石青 + 珊瑚粉
+    ("藏青樱粉",   "#1E40AF", "#FECDD3"),   # 深海藏青 + 樱花粉
+    ("碧落月白",   "#2E86AB", "#F5F7FA"),   # 碧落青 + 月白
+    ("黛青檀烟",   "#5A724F", "#EBE3D5"),   # 远山黛 + 檀米色
+    ("天青霁色",   "#4A6FA5", "#EEF2F7"),   # 霁蓝 + 素清白
 ]
 
 HISTORY_PANEL_STYLESHEET = """
 QWidget {
-    background: #e7e1d7;
-    color: #2f312d;
+    background: transparent;
+    color: #FEFFFF;
     border: none;
 }
 QFrame#historyCard {
-    background: #f8f4ed;
-    border: 1px solid #d7cec1;
+    background: rgba(30, 47, 66, 0.96);
+    border: 1px solid rgba(71, 112, 155, 0.45);
     border-radius: 18px;
 }
 QFrame#titleBar {
-    background: #efe7db;
-    border: 1px solid #ddd2c3;
+    background: rgba(71, 112, 155, 0.78);
+    border: 1px solid rgba(254, 255, 255, 0.16);
     border-radius: 14px;
 }
 QLabel#historyTitle {
-    color: #2f312d;
+    color: #FEFFFF;
     font-size: 18px;
     font-weight: 700;
 }
 QLabel#historySubtitle {
-    color: #6f736b;
+    color: rgba(254, 255, 255, 0.72);
     font-size: 12px;
 }
 QListWidget {
-    background: #fdfbf8;
-    border: 1px solid #ddd2c3;
+    background: rgba(254, 255, 255, 0.08);
+    border: 1px solid rgba(71, 112, 155, 0.38);
     border-radius: 14px;
     padding: 6px;
     outline: none;
@@ -123,46 +89,49 @@ QListWidget::item {
     border-radius: 10px;
     padding: 12px 14px;
     margin: 3px 0;
-    color: #2f312d;
+    color: #FEFFFF;
 }
 QListWidget::item:selected {
-    background: #dde4d8;
+    background: rgba(71, 112, 155, 0.55);
+    color: #FEFFFF;
 }
 QListWidget::item:hover {
-    background: #ece7df;
+    background: rgba(71, 112, 155, 0.22);
 }
 QTextEdit {
-    background: #fdfbf8;
-    border: 1px solid #ddd2c3;
+    background: rgba(254, 255, 255, 0.08);
+    border: 1px solid rgba(71, 112, 155, 0.38);
     border-radius: 14px;
-    color: #2f312d;
+    color: #FEFFFF;
     padding: 12px;
-    selection-background-color: #d9ddd7;
+    selection-background-color: rgba(71, 112, 155, 0.45);
 }
 QPushButton {
-    background: #d9dfd2;
-    color: #2f312d;
-    border: 1px solid #c4ccbc;
+    background: rgba(71, 112, 155, 0.34);
+    color: #FEFFFF;
+    border: 1px solid rgba(254, 255, 255, 0.18);
     border-radius: 12px;
     padding: 10px 16px;
+    font-weight: 500;
 }
 QPushButton:hover {
-    background: #cfd7c7;
+    background: rgba(71, 112, 155, 0.5);
+    border-color: rgba(254, 255, 255, 0.3);
 }
 QPushButton:pressed {
-    background: #c3ccb9;
+    background: rgba(71, 112, 155, 0.64);
 }
 QLineEdit, QDateTimeEdit {
-    background: #fdfbf8;
-    border: 1px solid #ddd2c3;
+    background: rgba(254, 255, 255, 0.08);
+    border: 1px solid rgba(71, 112, 155, 0.4);
     border-radius: 14px;
-    color: #2f312d;
+    color: #FEFFFF;
     padding: 12px 14px;
     font-size: 16px;
-    selection-background-color: #d9ddd7;
+    selection-background-color: rgba(71, 112, 155, 0.45);
 }
 QLineEdit::placeholder {
-    color: #8a8d86;
+    color: rgba(254, 255, 255, 0.45);
 }
 QDateTimeEdit::drop-down {
     width: 30px;
@@ -175,7 +144,97 @@ QDateTimeEdit::down-arrow {
 }
 """
 
-REMINDER_PANEL_STYLESHEET = HISTORY_PANEL_STYLESHEET
+REMINDER_PANEL_STYLESHEET = """
+QWidget {
+    background: transparent;
+    color: #FEFFFF;
+    border: none;
+}
+QFrame#historyCard {
+    background: rgba(30, 47, 66, 0.96);
+    border: 1px solid rgba(71, 112, 155, 0.45);
+    border-radius: 18px;
+}
+QFrame#titleBar {
+    background: rgba(71, 112, 155, 0.78);
+    border: 1px solid rgba(254, 255, 255, 0.16);
+    border-radius: 14px;
+}
+QLabel#historyTitle {
+    color: #FEFFFF;
+    font-size: 18px;
+    font-weight: 700;
+}
+QLabel#historySubtitle {
+    color: rgba(254, 255, 255, 0.72);
+    font-size: 12px;
+}
+QListWidget {
+    background: rgba(254, 255, 255, 0.08);
+    border: 1px solid rgba(71, 112, 155, 0.38);
+    border-radius: 14px;
+    padding: 6px;
+    outline: none;
+}
+QListWidget::item {
+    background: transparent;
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 3px 0;
+    color: #FEFFFF;
+}
+QListWidget::item:selected {
+    background: rgba(71, 112, 155, 0.55);
+    color: #FEFFFF;
+}
+QListWidget::item:hover {
+    background: rgba(71, 112, 155, 0.22);
+}
+QTextEdit {
+    background: rgba(254, 255, 255, 0.08);
+    border: 1px solid rgba(71, 112, 155, 0.38);
+    border-radius: 14px;
+    color: #FEFFFF;
+    padding: 12px;
+    selection-background-color: rgba(71, 112, 155, 0.45);
+}
+QPushButton {
+    background: rgba(71, 112, 155, 0.34);
+    color: #FEFFFF;
+    border: 1px solid rgba(254, 255, 255, 0.18);
+    border-radius: 12px;
+    padding: 10px 16px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background: rgba(71, 112, 155, 0.5);
+    border-color: rgba(254, 255, 255, 0.3);
+}
+QPushButton:pressed {
+    background: rgba(71, 112, 155, 0.64);
+}
+QLineEdit, QDateTimeEdit {
+    background: rgba(254, 255, 255, 0.08);
+    border: 1px solid rgba(71, 112, 155, 0.4);
+    border-radius: 14px;
+    color: #FEFFFF;
+    padding: 12px 14px;
+    font-size: 16px;
+    selection-background-color: rgba(71, 112, 155, 0.45);
+}
+QLineEdit::placeholder {
+    color: rgba(254, 255, 255, 0.45);
+}
+QDateTimeEdit::drop-down {
+    width: 30px;
+    border: none;
+    background: transparent;
+}
+QDateTimeEdit::down-arrow {
+    width: 12px;
+    height: 12px;
+}
+"""
 
 
 class DraggableFramelessMixin:
@@ -293,16 +352,14 @@ class ThemeColorButton(QPushButton):
 
 class SettingsPanel(QWidget):
 
-    COLS = 4
     theme_changed = pyqtSignal(str, str)
+    theme_selected = pyqtSignal(int)
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self._parent_window = parent
-        self._selected_user = THEMES[0][0]
-        self._selected_assistant = THEMES[0][1]
-        self._user_buttons: list[ThemeColorButton] = []
-        self._assistant_buttons: list[ThemeColorButton] = []
+        self._selected_idx = 0
+        self._theme_buttons: list[QPushButton] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -311,71 +368,139 @@ class SettingsPanel(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.Tool,
         )
-        self.setFixedWidth(280)
+        self.setFixedWidth(260)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(8)
+        main_layout.setSpacing(12)
 
-        title = QLabel("主题设置")
+        # 标题
+        title = QLabel("◈ 主题设置")
         title.setFont(QFont("Microsoft YaHei UI", 13, QFont.Weight.Bold))
         title.setStyleSheet("QLabel { color: #F1F5F9; background: transparent; }")
         main_layout.addWidget(title)
 
+        # 分隔线
         separator = QFrame()
         separator.setFrameShape(QFrame.Shape.HLine)
         separator.setStyleSheet("QFrame { background: rgba(255,255,255,0.1); border: none; }")
         main_layout.addWidget(separator)
 
-        user_label = QLabel("用户气泡颜色")
-        user_label.setFont(QFont("Microsoft YaHei UI", 11))
-        user_label.setStyleSheet("QLabel { color: #94A3B8; background: transparent; }")
-        main_layout.addWidget(user_label)
+        # 副标题
+        subtitle = QLabel("选择你喜欢的主题配色")
+        subtitle.setFont(QFont("Microsoft YaHei UI", 10))
+        subtitle.setStyleSheet("QLabel { color: #94A3B8; background: transparent; }")
+        main_layout.addWidget(subtitle)
 
-        user_grid = QGridLayout()
-        user_grid.setSpacing(6)
-        for i, (_, assistant) in enumerate(THEMES):
-            btn = ThemeColorButton(assistant, True, self)
-            btn.clicked.connect(lambda c, is_u=True: self._on_color_clicked(c, True))
-            self._assistant_buttons.append(btn)
-            row, col = divmod(i, self.COLS)
-            user_grid.addWidget(btn, row, col)
-        main_layout.addLayout(user_grid)
-
-        assistant_label = QLabel("AI 气泡颜色")
-        assistant_label.setFont(QFont("Microsoft YaHei UI", 11))
-        assistant_label.setStyleSheet("QLabel { color: #94A3B8; background: transparent; }")
-        main_layout.addWidget(assistant_label)
-
-        assistant_grid = QGridLayout()
-        assistant_grid.setSpacing(6)
-        for i, (user, _) in enumerate(THEMES):
-            btn = ThemeColorButton(user, False, self)
-            btn.clicked.connect(lambda c, is_u=False: self._on_color_clicked(c, False))
-            self._user_buttons.append(btn)
-            row, col = divmod(i, self.COLS)
-            assistant_grid.addWidget(btn, row, col)
-        main_layout.addLayout(assistant_grid)
-
+        # 主题卡片网格
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(10)
+        
+        cols = 2
+        for i, theme_data in enumerate(THEMES):
+            name = theme_data[0]
+            user_color = theme_data[1]
+            assistant_color = theme_data[2]
+            
+            # 创建主题卡片
+            card = self._create_theme_card(name, user_color, assistant_color, i)
+            self._theme_buttons.append(card)
+            
+            row, col = divmod(i, cols)
+            grid_layout.addWidget(card, row, col)
+        
+        main_layout.addLayout(grid_layout)
         main_layout.addStretch(1)
 
-        self._update_button_states()
+        self._update_card_states()
 
         self.setStyleSheet("QWidget { background: rgba(20, 24, 40, 0.95); }")
 
-    def _update_button_states(self) -> None:
-        for btn in self._user_buttons:
-            btn.set_selected(btn._color == self._selected_user)
-        for btn in self._assistant_buttons:
-            btn.set_selected(btn._color == self._selected_assistant)
+    def _create_theme_card(self, name: str, user_color: str, assistant_color: str, idx: int) -> QPushButton:
+        """创建主题卡片按钮"""
+        card = QPushButton(self)
+        card.setFixedHeight(60)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.setFont(QFont("Microsoft YaHei UI", 10, QFont.Weight.Medium))
+        card.setProperty("themeIdx", idx)
+        
+        # 创建预览气泡
+        preview = QPixmap(100, 30)
+        preview.fill(QColor(user_color))
+        painter = QPainter(preview)
+        # 绘制用户气泡
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(user_color))
+        painter.drawRoundedRect(0, 2, 40, 20, 6, 6)
+        # 绘制AI气泡
+        painter.setBrush(QColor(assistant_color))
+        painter.drawRoundedRect(50, 8, 50, 20, 6, 6)
+        painter.end()
+        
+        card.setIcon(QIcon(preview))
+        card.setIconSize(QSize(100, 30))
+        card.setText(f"  {name}")
+        card.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        
+        # 获取text位置，调整
+        card.setStyleSheet("""
+            QPushButton {
+                background: rgba(30, 41, 59, 0.8);
+                border: 2px solid rgba(255, 255, 255, 0.1);
+                border-radius: 10px;
+                padding: 6px 8px;
+                text-align: left;
+                color: #F1F5F9;
+            }
+            QPushButton:hover {
+                background: rgba(50, 61, 79, 0.9);
+                border: 2px solid rgba(99, 102, 241, 0.5);
+            }
+        """)
+        
+        card.clicked.connect(lambda _, index=idx: self._on_theme_selected(index))
+        return card
 
-    def _on_color_clicked(self, color: str, is_user: bool) -> None:
-        if is_user:
-            self._selected_user = color
-        else:
-            self._selected_assistant = color
-        self._update_button_states()
-        self.theme_changed.emit(self._selected_user, self._selected_assistant)
+    def _update_card_states(self) -> None:
+        for i, card in enumerate(self._theme_buttons):
+            is_selected = i == self._selected_idx
+            if is_selected:
+                card.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(99, 102, 241, 0.25);
+                        border: 2px solid #6366F1;
+                        border-radius: 10px;
+                        padding: 6px 8px;
+                        text-align: left;
+                        color: #E0E7FF;
+                    }
+                    QPushButton:hover {
+                        background: rgba(99, 102, 241, 0.35);
+                        border: 2px solid #818CF8;
+                    }
+                """)
+            else:
+                card.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(30, 41, 59, 0.8);
+                        border: 2px solid rgba(255, 255, 255, 0.1);
+                        border-radius: 10px;
+                        padding: 6px 8px;
+                        text-align: left;
+                        color: #F1F5F9;
+                    }
+                    QPushButton:hover {
+                        background: rgba(50, 61, 79, 0.9);
+                        border: 2px solid rgba(99, 102, 241, 0.5);
+                    }
+                """)
+
+    def _on_theme_selected(self, idx: int) -> None:
+        self._selected_idx = idx
+        self._update_card_states()
+        theme_data = THEMES[idx]
+        self.theme_selected.emit(idx)
+        self.theme_changed.emit(theme_data[1], theme_data[2])
 
     def show_at_star(self, star_geometry: QRect) -> None:
         x = star_geometry.right() + 10
@@ -1001,8 +1126,8 @@ class ChatMessageList(QWidget):
         self._pending_bubble: ChatBubble | None = None
         self._batch_timer: QTimer | None = None
         self._pending_chunks: list[str] = []
-        self._theme_user = THEMES[0][0]
-        self._theme_assistant = THEMES[0][1]
+        self._theme_user = THEMES[0][1]
+        self._theme_assistant = THEMES[0][2]
         self._build_ui()
 
     def set_theme(self, user: str, assistant: str) -> None:
@@ -1510,23 +1635,72 @@ class BubbleWindow(QWidget):
 
     def _show_theme_menu(self) -> None:
         menu = QMenu("选择主题", self)
-        for i, (user, assistant) in enumerate(THEMES):
-            user_color = _hex_to_rgb(user)
-            assistant_color = _hex_to_rgb(assistant)
-            label = f"  用户 #{i+1:02d}   AI #{i+1:02d}"
-            action = menu.addAction(label)
-            action.setData(i)
-            px = QPixmap(14, 14)
-            px.fill(QColor(*user_color))
-            action.setIcon(QIcon(px))
+        menu.setStyleSheet("""
+            QMenu {
+                background: #1E293B;
+                border: 1px solid rgba(99, 102, 241, 0.3);
+                border-radius: 12px;
+                padding: 8px;
+                min-width: 200px;
+            }
+            QMenu::item {
+                color: #F1F5F9;
+                padding: 10px 16px;
+                border-radius: 8px;
+                font-family: "Microsoft YaHei UI";
+                font-size: 13px;
+            }
+            QMenu::item:selected {
+                background: rgba(99, 102, 241, 0.3);
+            }
+            QMenu::item:checked {
+                background: rgba(99, 102, 241, 0.4);
+                color: #A5B4FC;
+            }
+            QMenu::separator {
+                background: rgba(255,255,255,0.1);
+                height: 1px;
+                margin: 6px 12px;
+            }
+        """)
+        
+        # 显示标题
+        title_action = menu.addAction("◈ 切换主题")
+        title_action.setEnabled(False)
+        title_action.setFont(QFont("Microsoft YaHei UI", 11, QFont.Weight.Bold))
         menu.addSeparator()
-        menu.addAction("取消")
+        
+        # 添加每个主题
+        for i, theme_data in enumerate(THEMES):
+            name = theme_data[0]
+            user_color = theme_data[1]
+            assistant_color = theme_data[2]
+            
+            # 创建双色预览图标 (28x14: 左半用户色，右半AI色)
+            preview = QPixmap(28, 14)
+            preview.fill(QColor(user_color))
+            painter = QPainter(preview)
+            painter.fillRect(14, 0, 14, 14, QColor(assistant_color))
+            painter.end()
+            
+            action = menu.addAction(f"  {name}")
+            action.setIcon(QIcon(preview))
+            action.setData(i)
+            
+            # 如果是当前主题，添加选中标记
+            if i == getattr(self, '_current_theme_idx', 0):
+                action.setCheckable(True)
+                action.setChecked(True)
+        
+        menu.addSeparator()
+        cancel_action = menu.addAction("取消")
+        
         chosen = menu.exec(QCursor.pos())
-        if chosen and chosen.data() is not None:
+        if chosen and chosen.data() is not None and chosen != cancel_action:
             idx = chosen.data()
-            user, assistant = THEMES[idx]
+            theme_data = THEMES[idx]
             self._current_theme_idx = idx
-            self._input._msg_list.set_theme(user, assistant)
+            self._input._msg_list.set_theme(theme_data[1], theme_data[2])
 
     def _on_theme_changed(self, user: str, assistant: str) -> None:
         self._input._msg_list.set_theme(user, assistant)
@@ -1678,14 +1852,6 @@ class BubbleWindow(QWidget):
             self._input._msg_list.load_history(result.current_history)
         self._refresh_history_window()
 
-    def _create_test_reminder(self) -> None:
-        reminder = self._reminder_service.create_test_reminder(delay_seconds=10)
-        self._input._msg_list.add_message(
-            "assistant",
-            self._reminder_service.format_created_reply(reminder),
-        )
-        self._refresh_history_window()
-
     def _handle_scheduler_trigger(self, reminder) -> None:
         self.reminder_triggered.emit(reminder)
 
@@ -1735,7 +1901,6 @@ class BubbleWindow(QWidget):
         menu.addAction("提醒与待办", self._show_reminder_window)
         menu.addSeparator()
         menu.addAction("新建提醒", self._show_create_reminder_dialog)
-        menu.addAction("10秒后测试提醒", self._create_test_reminder)
         menu.addSeparator()
         menu.addAction("切换主题", self._show_theme_menu)
         menu.addSeparator()
@@ -1748,7 +1913,7 @@ class BubbleWindow(QWidget):
             QMenu {
                 background: #1E293B;
                 border: 1px solid rgba(99, 102, 241, 0.3);
-                border-radius: 10px;
+                border-radius: 12px;
                 padding: 8px;
             }
             QMenu::item {
@@ -1766,6 +1931,10 @@ class BubbleWindow(QWidget):
                 height: 1px;
                 margin: 6px 12px;
             }
+            QMenu::indicator {
+                width: 14px;
+                height: 14px;
+            }
         """)
 
         menu.addAction("打开聊天")
@@ -1773,15 +1942,57 @@ class BubbleWindow(QWidget):
         menu.addAction("提醒与待办")
         menu.addSeparator()
         menu.addAction("新建提醒")
-        menu.addAction("10秒后测试提醒")
         menu.addSeparator()
-        menu.addAction("切换主题")
+        
+        # 主题子菜单
+        theme_submenu = QMenu("◈ 切换主题", menu)
+        theme_submenu.setStyleSheet("""
+            QMenu {
+                background: #1E293B;
+                border: 1px solid rgba(99, 102, 241, 0.3);
+                border-radius: 12px;
+                padding: 8px;
+            }
+            QMenu::item {
+                color: #F1F5F9;
+                padding: 10px 16px;
+                border-radius: 8px;
+                font-family: "Microsoft YaHei UI";
+                font-size: 13px;
+            }
+            QMenu::item:selected {
+                background: rgba(99, 102, 241, 0.3);
+            }
+        """)
+        
+        for i, theme_data in enumerate(THEMES):
+            name = theme_data[0]
+            user_color = theme_data[1]
+            assistant_color = theme_data[2]
+            
+            # 创建双色预览图标
+            preview = QPixmap(28, 14)
+            preview.fill(QColor(user_color))
+            painter = QPainter(preview)
+            painter.fillRect(14, 0, 14, 14, QColor(assistant_color))
+            painter.end()
+            
+            action = theme_submenu.addAction(f"  {name}")
+            action.setIcon(QIcon(preview))
+            action.setData(i)
+            
+            # 当前主题标记
+            if i == getattr(self, '_current_theme_idx', 0):
+                action.setCheckable(True)
+                action.setChecked(True)
+        
+        menu.addMenu(theme_submenu)
         menu.addSeparator()
         menu.addAction("退出")
 
         action = menu.exec(QCursor.pos())
         if action:
-            text = action.text()
+            text = action.text().strip()
             if text == "打开聊天":
                 self._show_window()
             elif text == "多轮对话":
@@ -1790,13 +2001,16 @@ class BubbleWindow(QWidget):
                 self._show_reminder_window()
             elif text == "新建提醒":
                 self._show_create_reminder_dialog()
-            elif text == "10秒后测试提醒":
-                self._create_test_reminder()
-            elif text == "切换主题":
-                self._show_theme_menu()
             elif text == "退出":
                 self.close()
                 QApplication.instance().quit()
+            else:
+                # 检查是否是主题选择
+                for i, theme_data in enumerate(THEMES):
+                    if text == theme_data[0]:
+                        self._current_theme_idx = i
+                        self._input._msg_list.set_theme(theme_data[1], theme_data[2])
+                        break
 
     def _show_reminder_window(self) -> None:
         self._refresh_reminder_window()

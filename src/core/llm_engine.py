@@ -30,6 +30,8 @@ class LLMEngine:
     api_key: str = os.getenv("LLM_API_KEY")
     model: str = os.getenv("LLM_MODEL")
     base_url: str = os.getenv("LLM_BASE_URL")
+    reasoning_effort: Optional[str] = os.getenv("LLM_REASONING_EFFORT")
+    extra_body: str = os.getenv("LLM_EXTRA_BODY", "")
     history: List[Message] = field(default_factory=list)
 
     def add_user_message(self, content: str) -> None:
@@ -41,21 +43,44 @@ class LLMEngine:
     def clear_history(self) -> None:
         self.history.clear()
 
-    async def _request(
+    def _build_payload(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         stream: bool = False,
-        timeout: float = 30.0,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": stream,
         }
+
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+
+        if self.extra_body.strip():
+            try:
+                extra = json.loads(self.extra_body)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid LLM_EXTRA_BODY JSON: {exc}") from exc
+            if not isinstance(extra, dict):
+                raise ValueError("LLM_EXTRA_BODY must be a JSON object")
+            payload.update(extra)
+
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+
+        return payload
+
+    async def _request(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        stream: bool = False,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        payload = self._build_payload(messages, tools=tools, stream=stream)
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
@@ -133,11 +158,7 @@ class LLMEngine:
                 "POST",
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "stream": True,
-                },
+                json=self._build_payload(messages, stream=True),
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
